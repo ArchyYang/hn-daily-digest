@@ -23,6 +23,7 @@ import os
 import smtplib
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -147,11 +148,37 @@ def summarize_with_llm(stories: list[dict]) -> str:
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.load(resp)
-    except urllib.error.HTTPError as e:
-        raise SystemExit(f"LLM request failed ({e.code}): {e.read().decode()[:500]}")
+
+    # Retry transient errors (rate limit / server overload) with backoff.
+    transient = {429, 500, 502, 503, 504}
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.load(resp)
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()[:500]
+            if e.code in transient and attempt < max_attempts:
+                wait = min(2 ** attempt, 30)
+                print(
+                    f"LLM {e.code} (attempt {attempt}/{max_attempts}); "
+                    f"retrying in {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            raise SystemExit(f"LLM request failed ({e.code}): {body}")
+        except urllib.error.URLError as e:
+            if attempt < max_attempts:
+                wait = min(2 ** attempt, 30)
+                print(
+                    f"LLM connection error ({e.reason}); retrying in {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            raise SystemExit(f"LLM request failed: {e.reason}")
 
     content = data["choices"][0]["message"]["content"].strip()
     return parse_summary(content)
