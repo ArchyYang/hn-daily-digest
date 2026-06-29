@@ -1,0 +1,40 @@
+name: HN Daily Digest
+
+on:
+  schedule:
+    # 13:00 UTC every day (~9am US Eastern). Adjust as you like.
+    - cron: "0 13 * * *"
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate and email the digest
+        env:
+          # --- LLM ---
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}      # openai | gemini | custom
+          LLM_MODEL: ${{ vars.LLM_MODEL }}            # optional override
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}      # only for provider=custom
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          TOP_N: ${{ vars.TOP_N }}                    # optional, default 15
+          # --- Email (SMTP) ---
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_STARTTLS: ${{ vars.SMTP_STARTTLS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python hn_digest.py
