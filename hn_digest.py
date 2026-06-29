@@ -84,7 +84,7 @@ PROVIDER_PRESETS = {
 
 
 def summarize_with_llm(stories: list[dict]) -> str:
-    provider = os.environ.get("LLM_PROVIDER", "openai").lower()
+    provider = (os.environ.get("LLM_PROVIDER") or "openai").lower()
     if provider not in PROVIDER_PRESETS:
         raise SystemExit(
             f"Unknown LLM_PROVIDER '{provider}'. Use: {', '.join(PROVIDER_PRESETS)}"
@@ -241,7 +241,7 @@ def send_email(subject: str, html: str, text: str) -> bool:
     if not (host and sender and recipients):
         return False
 
-    port = int(os.environ.get("SMTP_PORT", "587"))
+    port = int(os.environ.get("SMTP_PORT") or "587")
     user = os.environ.get("SMTP_USER")
     password = os.environ.get("SMTP_PASS")
     use_starttls = os.environ.get("SMTP_STARTTLS", "true").lower() != "false"
@@ -275,7 +275,7 @@ def send_email(subject: str, html: str, text: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
-    top_n = int(os.environ.get("TOP_N", "15"))
+    top_n = int(os.environ.get("TOP_N") or "15")
     date_str = datetime.now(timezone.utc).strftime("%A, %d %B %Y (UTC)")
 
     print(f"Fetching top {top_n} Hacker News stories...", file=sys.stderr)
