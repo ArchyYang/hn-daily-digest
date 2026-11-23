@@ -544,7 +544,7 @@ PROVIDER_PRESETS = {
     "gemini": {
         # Google's OpenAI-compatible endpoint.
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-3-pro-preview",
+        "default_model": "gemini-3.8-flash",
     },
     "custom": {
         "base_url": None,  # must be supplied via LLM_BASE_URL
@@ -612,7 +612,8 @@ def build_llm_prompt(stories: list[dict], spiciest: dict | None = None) -> tuple
     return system, user
 
 
-def summarize_with_llm(stories: list[dict], spiciest: dict | None = None) -> dict:
+def call_llm(system: str, user: str) -> str:
+    """Call an OpenAI-compatible chat/completions endpoint with retry/backoff."""
     provider = (os.environ.get("LLM_PROVIDER") or "openai").lower()
     if provider not in PROVIDER_PRESETS:
         raise SystemExit(
@@ -632,8 +633,6 @@ def summarize_with_llm(stories: list[dict], spiciest: dict | None = None) -> dic
     model = os.environ.get("LLM_MODEL") or preset["default_model"]
     if not model:
         raise SystemExit("LLM_MODEL is required for this provider.")
-
-    system, user = build_llm_prompt(stories, spiciest=spiciest)
 
     payload = json.dumps(
         {
@@ -688,7 +687,12 @@ def summarize_with_llm(stories: list[dict], spiciest: dict | None = None) -> dic
                 continue
             raise SystemExit(f"LLM request failed: {e.reason}")
 
-    content = data["choices"][0]["message"]["content"].strip()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def summarize_with_llm(stories: list[dict], spiciest: dict | None = None) -> dict:
+    system, user = build_llm_prompt(stories, spiciest=spiciest)
+    content = call_llm(system, user)
     return parse_summary(content)
 
 

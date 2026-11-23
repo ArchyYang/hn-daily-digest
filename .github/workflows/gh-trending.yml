@@ -1,0 +1,60 @@
+name: GitHub Trending Daily Digest
+
+on:
+  schedule:
+    # 13:05 UTC every day (5 minutes after the HN digest). Adjust as you like.
+    - cron: "5 13 * * *"
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore seen GitHub repos cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state/gh_seen.json
+          key: gh-seen-${{ github.run_id }}
+          restore-keys: |
+            gh-seen-
+
+      - name: Generate and email GitHub Trending digest
+        env:
+          # --- LLM ---
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}          # openai | gemini | custom
+          LLM_MODEL: ${{ vars.LLM_MODEL }}                # optional override
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}          # only for provider=custom
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          # --- GitHub Trending ---
+          GH_TOP_N: ${{ vars.GH_TOP_N }}                  # optional, default 10
+          GH_LANGUAGE: ${{ vars.GH_LANGUAGE }}            # optional, e.g. python, rust
+          GH_SINCE: ${{ vars.GH_SINCE }}                  # optional, daily (default) | weekly | monthly
+          GH_DEDUP_ENABLED: ${{ vars.GH_DEDUP_ENABLED }}  # optional, default true
+          GH_FETCH_READMES: ${{ vars.GH_FETCH_READMES }}  # optional, default true
+          # --- Email (SMTP) ---
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_STARTTLS: ${{ vars.SMTP_STARTTLS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python gh_trending.py
+
+      - name: Save seen GitHub repos cache
+        if: hashFiles('state/gh_seen.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state/gh_seen.json
+          key: gh-seen-${{ github.run_id }}

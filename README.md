@@ -1,13 +1,11 @@
-# Hacker News Daily Digest
+# Hacker News & GitHub Trending Daily Digests
 
-A zero-dependency GitHub Action that, once a day:
+Zero-dependency GitHub Actions that send two clean daily emails:
 
-1. **Fetches the top Hacker News stories from the past 24 hours** (Algolia HN API — free, no key) and deduplicates against the last 7 days via GitHub Actions Cache.
-2. **Enriches stories concurrently** with readable article excerpts (for real 1-line TL;DRs), top HN comments (for community consensus & pushback), and a **Spiciest Debate** spotlight based on comments-to-points ratio.
-3. **Summarizes everything with an LLM** of your choice (OpenAI, Gemini, or any OpenAI-compatible endpoint via `custom`).
-4. **Emails the digest** (HTML + plain text) over SMTP.
+1. **Hacker News Daily Digest (`hn_digest.py`)** — rolling 24h top stories, article TL;DRs, HN comment synthesis, **Spiciest Debate** spotlight, and 7-day dedup via Actions Cache.
+2. **GitHub Trending Daily Digest (`gh_trending.py`)** — daily trending repositories, README-grounded TL;DRs, **Breakout Repo** spotlight, language & star velocity stats, and 7-day dedup via Actions Cache.
 
-The script (`hn_digest.py`) uses only the Python standard library, so there is nothing to `pip install`.
+Both scripts use only the Python standard library, so there is nothing to `pip install`.
 
 ## How it works
 
@@ -32,7 +30,7 @@ anything sensitive and **Variables** for the rest
 | --------------- | --------- | -------- | ------------------------------------------------------------ |
 | `LLM_API_KEY`   | Secret    | ✅       | API key for your provider.                                   |
 | `LLM_PROVIDER`  | Variable  | optional | `openai` (default), `gemini`, or `custom`.                   |
-| `LLM_MODEL`     | Variable  | optional | Defaults: `gpt-4o-mini` (openai), `gemini-3-pro-preview` (gemini). |
+| `LLM_MODEL`     | Variable  | optional | Defaults: `gpt-4o-mini` (openai), `gemini-3.8-flash` (gemini). |
 | `LLM_BASE_URL`  | Variable  | only for `custom` | Any OpenAI-compatible base URL (OpenRouter, Groq, local, …). |
 
 ### Digest & Enrichment
@@ -45,6 +43,17 @@ anything sensitive and **Variables** for the rest
 | `STATE_FILE`     | Variable | optional | Path to rolling seen-IDs JSON. Default `state/seen.json`.                  |
 | `FETCH_ARTICLES` | Variable | optional | `true` (default) to fetch article excerpts for grounded 1-line TL;DRs.     |
 | `COMMENT_TOP_K`  | Variable | optional | Number of top stories (+ spiciest debate) to fetch HN comments for. Default `8` (`0` disables). |
+
+### GitHub Trending (`gh_trending.py`)
+
+| Variable           | Where    | Required | Notes                                                                       |
+| ------------------ | -------- | -------- | --------------------------------------------------------------------------- |
+| `GH_TOP_N`         | Variable | optional | Number of trending repos to include. Default `10`.                          |
+| `GH_LANGUAGE`      | Variable | optional | Optional language slug (e.g. `python`, `rust`, `typescript`). Blank = all.  |
+| `GH_SINCE`         | Variable | optional | `daily` (default), `weekly`, or `monthly`.                                  |
+| `GH_DEDUP_ENABLED` | Variable | optional | `true` (default) to skip repos sent in the last 7 days via Actions Cache.   |
+| `GH_STATE_FILE`    | Variable | optional | Path to rolling seen-repos JSON. Default `state/gh_seen.json`.              |
+| `GH_FETCH_READMES` | Variable | optional | `true` (default) to fetch README excerpts for grounded 1-line summaries.    |
 
 ### Email (SMTP)
 
@@ -65,9 +74,7 @@ anything sensitive and **Variables** for the rest
 
 **OpenAI** — `LLM_PROVIDER=openai`, `LLM_API_KEY=sk-...`
 **Gemini** — `LLM_PROVIDER=gemini`, `LLM_API_KEY=...` (uses Google's
-OpenAI-compatible endpoint). Default model is `gemini-3-pro-preview`, which
-requires a **billed** Google AI account. Free-tier keys must use a Flash model
-(set `LLM_MODEL=gemini-2.5-flash`).
+OpenAI-compatible endpoint; defaults to `gemini-3.8-flash`).
 **Anything else** (OpenRouter, Groq, DeepSeek, Ollama, …) —
 `LLM_PROVIDER=custom`, `LLM_BASE_URL=https://...`, `LLM_MODEL=...`
 
@@ -106,11 +113,12 @@ Use an [App Password](https://support.google.com/accounts/answer/185833)
 ```bash
 cp .env.example .env      # fill in your keys
 set -a; source .env; set +a
-python hn_digest.py
+python hn_digest.py       # Hacker News digest
+python gh_trending.py     # GitHub Trending digest
 ```
 
 Without `LLM_API_KEY` set, it will error on the LLM step; without SMTP it just
-prints to the terminal. Run tests with:
+prints to the terminal. Run all unit tests with:
 
 ```bash
 python3 -m unittest -v
@@ -118,6 +126,7 @@ python3 -m unittest -v
 
 ## Schedule
 
-The workflow runs daily at **13:00 UTC** and can be triggered manually from the
-**Actions** tab (`workflow_dispatch`). Edit the `cron` line in
-`.github/workflows/hn-digest.yml` to change the time.
+- **HN Daily Digest** runs daily at **13:00 UTC** (`.github/workflows/hn-digest.yml`).
+- **GitHub Trending Daily Digest** runs daily at **13:05 UTC** (`.github/workflows/gh-trending.yml`).
+
+Both can be triggered manually anytime from the **Actions** tab (`workflow_dispatch`).
