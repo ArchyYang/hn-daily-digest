@@ -10,3 +10,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Runtime dedup state (persisted via GitHub Actions cache)
+state/

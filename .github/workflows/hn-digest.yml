@@ -21,6 +21,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Restore seen stories cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state/seen.json
+          key: hn-seen-${{ github.run_id }}
+          restore-keys: |
+            hn-seen-
+
       - name: Generate and email the digest
         env:
           # --- LLM ---
@@ -28,7 +36,12 @@ jobs:
           LLM_MODEL: ${{ vars.LLM_MODEL }}            # optional override
           LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}      # only for provider=custom
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          # --- Digest & Enrichment ---
           TOP_N: ${{ vars.TOP_N }}                    # optional, default 15
+          FETCH_MODE: ${{ vars.FETCH_MODE }}          # optional, 24h (default) | front_page
+          DEDUP_ENABLED: ${{ vars.DEDUP_ENABLED }}    # optional, default true
+          FETCH_ARTICLES: ${{ vars.FETCH_ARTICLES }}  # optional, default true
+          COMMENT_TOP_K: ${{ vars.COMMENT_TOP_K }}    # optional, default 8
           # --- Email (SMTP) ---
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -38,3 +51,10 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python hn_digest.py
+
+      - name: Save seen stories cache
+        if: hashFiles('state/seen.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state/seen.json
+          key: hn-seen-${{ github.run_id }}

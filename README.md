@@ -2,18 +2,22 @@
 
 A zero-dependency GitHub Action that, once a day:
 
-1. **Fetches the top Hacker News stories** (Algolia HN front-page API — free, no key).
-2. **Summarizes them with an LLM** of your choice (OpenAI or Gemini, or any
-   OpenAI-compatible endpoint via `custom`).
-3. **Emails the digest** (HTML + plain text) over SMTP.
+1. **Fetches the top Hacker News stories from the past 24 hours** (Algolia HN API — free, no key) and deduplicates against the last 7 days via GitHub Actions Cache.
+2. **Enriches stories concurrently** with readable article excerpts (for real 1-line TL;DRs), top HN comments (for community consensus & pushback), and a **Spiciest Debate** spotlight based on comments-to-points ratio.
+3. **Summarizes everything with an LLM** of your choice (OpenAI, Gemini, or any OpenAI-compatible endpoint via `custom`).
+4. **Emails the digest** (HTML + plain text) over SMTP.
 
-The script (`hn_digest.py`) uses only the Python standard library, so there is
-nothing to `pip install`.
+The script (`hn_digest.py`) uses only the Python standard library, so there is nothing to `pip install`.
 
 ## How it works
 
 ```
-Algolia HN API ──▶ hn_digest.py ──▶ LLM (chat/completions) ──▶ SMTP ──▶ your inbox
+Algolia HN API (24h stories + top comments)
+  + Article excerpts (stdlib HTMLParser)
+  + Rolling 7-day dedup (Actions Cache)
+        │
+        ▼
+  hn_digest.py ──▶ LLM (structured JSON) ──▶ SMTP ──▶ your inbox
 ```
 
 ## Configuration
@@ -31,6 +35,17 @@ anything sensitive and **Variables** for the rest
 | `LLM_MODEL`     | Variable  | optional | Defaults: `gpt-4o-mini` (openai), `gemini-3-pro-preview` (gemini). |
 | `LLM_BASE_URL`  | Variable  | only for `custom` | Any OpenAI-compatible base URL (OpenRouter, Groq, local, …). |
 
+### Digest & Enrichment
+
+| Variable         | Where    | Required | Notes                                                                      |
+| ---------------- | -------- | -------- | -------------------------------------------------------------------------- |
+| `TOP_N`          | Variable | optional | Number of stories. Default `15`.                                           |
+| `FETCH_MODE`     | Variable | optional | `24h` (default, rolling past 24 hours) or `front_page` (current snapshot). |
+| `DEDUP_ENABLED`  | Variable | optional | `true` (default) to skip stories sent in the last 7 days via Actions Cache. |
+| `STATE_FILE`     | Variable | optional | Path to rolling seen-IDs JSON. Default `state/seen.json`.                  |
+| `FETCH_ARTICLES` | Variable | optional | `true` (default) to fetch article excerpts for grounded 1-line TL;DRs.     |
+| `COMMENT_TOP_K`  | Variable | optional | Number of top stories (+ spiciest debate) to fetch HN comments for. Default `8` (`0` disables). |
+
 ### Email (SMTP)
 
 | Variable        | Where    | Required | Notes                                         |
@@ -45,12 +60,6 @@ anything sensitive and **Variables** for the rest
 
 > If SMTP variables are missing, the script prints the digest to stdout instead
 > of emailing — handy for testing.
-
-### Other
-
-| Variable | Where    | Required | Notes                                |
-| -------- | -------- | -------- | ------------------------------------ |
-| `TOP_N`  | Variable | optional | Number of stories. Default `15`.     |
 
 ## Provider examples
 
@@ -101,7 +110,11 @@ python hn_digest.py
 ```
 
 Without `LLM_API_KEY` set, it will error on the LLM step; without SMTP it just
-prints to the terminal.
+prints to the terminal. Run tests with:
+
+```bash
+python3 -m unittest -v
+```
 
 ## Schedule
 
