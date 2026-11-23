@@ -38,9 +38,21 @@ from html import escape
 HN_FRONTPAGE = "https://hn.algolia.com/api/v1/search"
 
 
+def extract_domain(url: str | None) -> str:
+    """Extract a clean hostname (without 'www.') from an external story URL."""
+    if not url:
+        return ""
+    host = urllib.parse.urlparse(url).netloc.lower().split(":", 1)[0]
+    host = host.removeprefix("www.")
+    if host == "news.ycombinator.com":
+        return ""
+    return host
+
+
 def fetch_top_stories(top_n: int) -> list[dict]:
-    """Return the current front-page stories, sorted by points (desc)."""
-    params = urllib.parse.urlencode({"tags": "front_page", "hitsPerPage": top_n})
+    """Return the top front-page stories, sorted by points (desc)."""
+    # Fetch at least the full 30-item front page before sorting by points.
+    params = urllib.parse.urlencode({"tags": "front_page", "hitsPerPage": max(30, top_n)})
     url = f"{HN_FRONTPAGE}?{params}"
     req = urllib.request.Request(url, headers={"User-Agent": "hn-daily-digest"})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -48,15 +60,17 @@ def fetch_top_stories(top_n: int) -> list[dict]:
 
     stories = []
     for h in data.get("hits", []):
+        raw_url = h.get("url")
+        hn_url = f"https://news.ycombinator.com/item?id={h.get('objectID')}"
         stories.append(
             {
                 "title": h.get("title") or "(no title)",
-                "url": h.get("url")
-                or f"https://news.ycombinator.com/item?id={h.get('objectID')}",
+                "url": raw_url or hn_url,
+                "domain": extract_domain(raw_url),
                 "points": h.get("points") or 0,
                 "comments": h.get("num_comments") or 0,
                 "author": h.get("author") or "",
-                "hn_url": f"https://news.ycombinator.com/item?id={h.get('objectID')}",
+                "hn_url": hn_url,
             }
         )
     stories.sort(key=lambda s: s["points"], reverse=True)
@@ -84,7 +98,7 @@ PROVIDER_PRESETS = {
 }
 
 
-def summarize_with_llm(stories: list[dict]) -> str:
+def summarize_with_llm(stories: list[dict]) -> dict:
     provider = (os.environ.get("LLM_PROVIDER") or "openai").lower()
     if provider not in PROVIDER_PRESETS:
         raise SystemExit(
@@ -204,11 +218,16 @@ def parse_summary(content: str) -> dict:
 def render_html(summary: dict, stories: list[dict], date_str: str) -> str:
     rows = []
     for i, s in enumerate(stories, 1):
+        domain_html = (
+            f' <span style="font-size:12px;color:#888;">({escape(s["domain"])})</span>'
+            if s.get("domain")
+            else ""
+        )
         rows.append(
             f"""<tr>
               <td style="padding:6px 10px;color:#888;">{i}</td>
               <td style="padding:6px 10px;">
-                <a href="{escape(s['url'])}" style="color:#1a73e8;text-decoration:none;">{escape(s['title'])}</a>
+                <a href="{escape(s['url'])}" style="color:#1a73e8;text-decoration:none;">{escape(s['title'])}</a>{domain_html}
                 <div style="font-size:12px;color:#888;">
                   {s['points']} points &middot; {s['comments']} comments &middot;
                   <a href="{escape(s['hn_url'])}" style="color:#888;">discuss</a>
@@ -256,7 +275,10 @@ def render_text(summary: dict, stories: list[dict], date_str: str) -> str:
         lines += ["", "KEY TRENDS:"] + [f"- {t}" for t in trends]
     lines += ["", "TOP STORIES:"]
     for i, s in enumerate(stories, 1):
-        lines.append(f"{i}. {s['title']} ({s['points']} pts, {s['comments']} comments)")
+        domain_suffix = f" [{s['domain']}]" if s.get("domain") else ""
+        lines.append(
+            f"{i}. {s['title']}{domain_suffix} ({s['points']} pts, {s['comments']} comments)"
+        )
         lines.append(f"   {s['url']}")
     return "\n".join(lines)
 
