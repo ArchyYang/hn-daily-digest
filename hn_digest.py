@@ -656,7 +656,7 @@ def call_llm(system: str, user: str) -> str:
         method="POST",
     )
 
-    # Retry transient errors (rate limit / server overload) with backoff.
+    # Retry transient errors (rate limit / server overload / timeout) with backoff.
     transient = {429, 500, 502, 503, 504}
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
@@ -676,16 +676,17 @@ def call_llm(system: str, user: str) -> str:
                 time.sleep(wait)
                 continue
             raise SystemExit(f"LLM request failed ({e.code}): {body}")
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError) as e:
+            reason = e.reason if isinstance(e, urllib.error.URLError) else e
             if attempt < max_attempts:
                 wait = min(2 ** attempt, 30)
                 print(
-                    f"LLM connection error ({e.reason}); retrying in {wait}s...",
+                    f"LLM connection error ({reason}); retrying in {wait}s...",
                     file=sys.stderr,
                 )
                 time.sleep(wait)
                 continue
-            raise SystemExit(f"LLM request failed: {e.reason}")
+            raise SystemExit(f"LLM request failed: {reason}")
 
     return data["choices"][0]["message"]["content"].strip()
 
