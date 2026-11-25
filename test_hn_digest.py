@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, patch
 
 import hn_digest
@@ -290,6 +291,48 @@ class TestCommentsAndEnrichment(unittest.TestCase):
         self.assertEqual(set(fetched_comments), {"1", "3"})
         self.assertEqual(stories[1]["top_comments"], [])
         self.assertEqual(stories[2]["top_comments"], ["Comment on 3"])
+
+
+class TestCallLlm(unittest.TestCase):
+    def test_retries_timeout_from_open_or_response_read(self):
+        body = json.dumps({"choices": [{"message": {"content": " summary "}}]}).encode()
+        for during_read in (False, True):
+            with self.subTest(during_read=during_read):
+                failed_response = _mock_response(b"")
+                failed_response.__enter__.return_value.read.side_effect = TimeoutError("read timed out")
+                failure = failed_response if during_read else TimeoutError("read timed out")
+                with (
+                    patch.dict(os.environ, {"LLM_API_KEY": "test-key"}, clear=True),
+                    patch("urllib.request.urlopen", side_effect=[failure, _mock_response(body)]) as urlopen,
+                    patch("time.sleep") as sleep,
+                ):
+                    self.assertEqual(hn_digest.call_llm("system", "user"), "summary")
+                self.assertEqual(urlopen.call_count, 2)
+                sleep.assert_called_once_with(2)
+
+    def test_timeout_exhausts_retry_budget(self):
+        with (
+            patch.dict(os.environ, {"LLM_API_KEY": "test-key"}, clear=True),
+            patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")) as urlopen,
+            patch("time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(SystemExit, "LLM request failed: read timed out"):
+                hn_digest.call_llm("system", "user")
+        self.assertEqual(urlopen.call_count, 5)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 8, 16])
+
+    def test_url_error_still_retries(self):
+        body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+        with (
+            patch.dict(os.environ, {"LLM_API_KEY": "test-key"}, clear=True),
+            patch("urllib.request.urlopen", side_effect=[
+                urllib.error.URLError("connection failed"), _mock_response(body)
+            ]) as urlopen,
+            patch("time.sleep") as sleep,
+        ):
+            self.assertEqual(hn_digest.call_llm("system", "user"), "ok")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(2)
 
 
 class TestSummaryParsingAndRendering(unittest.TestCase):
