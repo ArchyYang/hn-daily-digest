@@ -1,11 +1,12 @@
-# Hacker News & GitHub Trending Daily Digests
+# Tech Signal & Daily Digests
 
-Zero-dependency GitHub Actions that send two clean daily emails:
+Zero-dependency GitHub Actions that run three clean, compounding intelligence workflows:
 
-1. **Hacker News Daily Digest (`hn_digest.py`)** — rolling 24h top stories, article TL;DRs, HN comment synthesis, **Spiciest Debate** spotlight, and 7-day dedup via Actions Cache.
-2. **GitHub Trending Daily Digest (`gh_trending.py`)** — daily trending repositories, README-grounded TL;DRs, **Breakout Repo** spotlight, language & star velocity stats, and 7-day dedup via Actions Cache.
+1. **Hacker News Daily Digest (`hn_digest.py`)** — rolling 24h top stories, article TL;DRs, HN comment synthesis, **Spiciest Debate** spotlight, `Ask HN`/`Show HN` pain-point mining, 3-day narrative continuity, and daily compounding archives on an orphan `data` branch.
+2. **GitHub Trending Daily Digest (`gh_trending.py`)** — daily trending repositories, README-grounded TL;DRs, **Breakout Repo** spotlight, **Idea Spark** brainstorm, and 7-day dedup via Actions Cache.
+3. **Weekly Tech Signal & Angles (`weekly_synthesis.py`)** — Sunday editorial brief compounding the week's HN signal atoms (+ prior weeks' memory), **Lobste.rs** top engineering threads, and top `👍`-reacted open issues across bellwether repos in `watchlist.json` into **"Connect-the-Dots" Article Pitches**, **Validated Pain Points**, and **Cross-Platform Convergence** (with optional Notion export and Day-1 Algolia bootstrap).
 
-Both scripts use only the Python standard library, so there is nothing to `pip install`.
+All scripts use only the Python standard library, so there is nothing to `pip install`.
 
 ## How it works
 
@@ -113,20 +114,22 @@ Use an [App Password](https://support.google.com/accounts/answer/185833)
 ```bash
 cp .env.example .env      # fill in your keys
 set -a; source .env; set +a
-python hn_digest.py       # Hacker News digest
-python gh_trending.py     # GitHub Trending digest
+python hn_digest.py          # Hacker News daily digest
+python gh_trending.py        # GitHub Trending daily digest
+python weekly_synthesis.py   # Weekly synthesis (bootstraps last 7d if .data is empty)
 ```
 
 Without `LLM_API_KEY` set, it will error on the LLM step; without SMTP it just
 prints to the terminal. Run all unit tests with:
 
 ```bash
-python3 -m unittest -v
+python3 -m unittest discover -v
 ```
 
 ## Schedule
 
-- **HN Daily Digest** runs daily at **13:00 UTC** (`.github/workflows/hn-digest.yml`).
+- **HN Daily Digest** runs daily at **13:00 UTC** (`.github/workflows/hn-digest.yml`) and archives compact daily JSON signals to the orphan `data` branch.
 - **GitHub Trending Daily Digest** runs daily at **13:05 UTC** (`.github/workflows/gh-trending.yml`).
+- **Weekly Tech Signal & Angles** runs Sundays at **14:00 UTC** (`.github/workflows/weekly-synthesis.yml`), compounding the `data` branch + Lobste.rs + `watchlist.json` GitHub issues (and optionally exporting to Notion if `NOTION_API_KEY` + `NOTION_DATABASE_ID` secrets are set).
 
-Both can be triggered manually anytime from the **Actions** tab (`workflow_dispatch`).
+All three can be triggered manually anytime from the **Actions** tab (`workflow_dispatch`).

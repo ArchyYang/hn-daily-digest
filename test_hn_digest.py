@@ -334,6 +334,95 @@ class TestCallLlm(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(2)
 
+    def test_gemini_defaults_to_low_reasoning_effort_and_retries_if_400_rejected(self):
+        captured_bodies = []
+
+        def fake_urlopen(req, timeout=180):
+            captured_bodies.append((json.loads(req.data.decode()), timeout))
+            if len(captured_bodies) == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    400,
+                    "Bad Request",
+                    {},
+                    io.BytesIO(b'{"error": "unknown field reasoning_effort"}'),
+                )
+            return _mock_response(
+                json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+            )
+
+        with (
+            patch.dict(
+                os.environ,
+                {"LLM_PROVIDER": "gemini", "LLM_API_KEY": "test-key"},
+                clear=True,
+            ),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            self.assertEqual(hn_digest.call_llm("sys", "usr"), "ok")
+
+        self.assertEqual(captured_bodies[0][0].get("reasoning_effort"), "low")
+        self.assertEqual(captured_bodies[0][1], 180)
+        self.assertNotIn("reasoning_effort", captured_bodies[1][0])
+
+
+class TestDailyArchiveAndAskShow(unittest.TestCase):
+    def test_save_daily_archive_and_load_recent_continuity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = {
+                "overview": "Day 1 overview.",
+                "trends": ["SQLite WAL2"],
+                "spiciest_debate": None,
+                "signals": [
+                    {
+                        "type": "pain_point",
+                        "topic": "local LLMs",
+                        "summary": "Tool calling fails on small models.",
+                        "story_id": "10",
+                    }
+                ],
+                "stories": {"10": {"tldr": "A tldr", "hn_take": "A take"}},
+            }
+            stories = [
+                {
+                    "object_id": "10",
+                    "title": "Story 10",
+                    "domain": "example.com",
+                    "url": "https://example.com/10",
+                    "hn_url": "https://news.ycombinator.com/item?id=10",
+                    "points": 200,
+                    "comments": 50,
+                }
+            ]
+            hn_digest.save_daily_archive(tmp, date(2026, 11, 20), summary, stories)
+            hn_digest.save_daily_archive(tmp, date(2026, 11, 22), summary, stories)
+            hn_digest.save_daily_archive(tmp, date(2026, 11, 25), summary, stories)
+
+            recent = hn_digest.load_recent_daily_archives(
+                tmp, days=2, before_date=date(2026, 11, 25)
+            )
+            self.assertEqual([r["date"] for r in recent], ["2026-11-20", "2026-11-22"])
+            self.assertEqual(recent[0]["signals"][0]["type"], "pain_point")
+
+            _, user_prompt = hn_digest.build_llm_prompt(
+                stories, recent_archives=recent
+            )
+            self.assertIn("Recent days' context", user_prompt)
+            self.assertIn("2026-11-22", user_prompt)
+
+    def test_fetch_ask_show_stories_excludes_existing_and_sorts_by_comments(self):
+        fake_hits = [
+            {"objectID": "1", "title": "Ask HN: Already in top", "points": 100, "num_comments": 200},
+            {"objectID": "2", "title": "Ask HN: Low cmts", "points": 80, "num_comments": 40},
+            {"objectID": "3", "title": "Show HN: High cmts", "points": 60, "num_comments": 150},
+        ]
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(json.dumps({"hits": fake_hits}).encode()),
+        ):
+            res = hn_digest.fetch_ask_show_stories(limit=2, exclude_ids={"1"}, now_ts=1_700_086_400)
+        self.assertEqual([r["object_id"] for r in res], ["3", "2"])
+
 
 class TestSummaryParsingAndRendering(unittest.TestCase):
     def test_parse_summary_full_structured_json(self):

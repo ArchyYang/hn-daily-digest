@@ -16,6 +16,10 @@ Configuration is via environment variables (see README.md):
   STATE_FILE      path to rolling seen-stories JSON (default: state/seen.json)
   FETCH_ARTICLES  true | false                      (default: true)
   COMMENT_TOP_K   stories to fetch comments for     (default: 8)
+  ASK_SHOW_N      extra Ask/Show HN threads to mine (default: 3)
+  ARCHIVE_DIR     optional dir for daily JSON archive (e.g. .data)
+  LLM_REASONING_EFFORT  minimal|low|medium|high     (default: low for gemini)
+  LLM_TIMEOUT     HTTP read timeout in seconds      (default: 180)
 
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS        (required to email)
   EMAIL_FROM, EMAIL_TO                               (required to email)
@@ -405,6 +409,146 @@ def fetch_top_stories(
     return all_stories[:top_n]
 
 
+def fetch_ask_show_stories(
+    limit: int = 3,
+    exclude_ids: set[str] | None = None,
+    lookback_seconds: int = 86400,
+    now_ts: int | None = None,
+) -> list[dict]:
+    """Fetch top Ask HN / Show HN discussions by comment volume (fail-soft)."""
+    if limit <= 0:
+        return []
+    cutoff = (now_ts if now_ts is not None else int(time.time())) - lookback_seconds
+    params = urllib.parse.urlencode(
+        {
+            "tags": "(ask_hn,show_hn)",
+            "numericFilters": f"created_at_i>{cutoff},points>=30,num_comments>=15",
+            "hitsPerPage": max(15, limit * 4),
+        }
+    )
+    url = f"{HN_SEARCH_API}?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"Warning: Ask/Show HN fetch failed: {e}", file=sys.stderr)
+        return []
+
+    excluded = exclude_ids or set()
+    results: list[dict] = []
+    for h in data.get("hits", []):
+        object_id = str(h.get("objectID") or "")
+        if not object_id or object_id in excluded:
+            continue
+        raw_url = h.get("url")
+        hn_url = f"https://news.ycombinator.com/item?id={object_id}"
+        points = h.get("points") or 0
+        comments = h.get("num_comments") or 0
+        results.append(
+            {
+                "object_id": object_id,
+                "title": h.get("title") or "(no title)",
+                "url": raw_url or hn_url,
+                "domain": extract_domain(raw_url),
+                "points": points,
+                "comments": comments,
+                "debate_ratio": round(comments / max(points, 1), 2),
+                "author": h.get("author") or "",
+                "hn_url": hn_url,
+                "story_text": strip_html(h.get("story_text")),
+                "article_excerpt": "",
+                "top_comments": [],
+            }
+        )
+    results.sort(key=lambda s: (s["comments"], s["points"]), reverse=True)
+    return results[:limit]
+
+
+def load_recent_daily_archives(
+    archive_dir: str,
+    days: int = 3,
+    before_date: date | None = None,
+) -> list[dict]:
+    """Load up to `days` most recent archived daily HN digests strictly before `before_date`."""
+    if not archive_dir:
+        return []
+    hn_dir = os.path.join(archive_dir, "hn")
+    if not os.path.isdir(hn_dir):
+        return []
+    cutoff_iso = (before_date or datetime.now(timezone.utc).date()).isoformat()
+    candidates = sorted(
+        (
+            fn
+            for fn in os.listdir(hn_dir)
+            if fn.endswith(".json") and fn[:-5] < cutoff_iso
+        ),
+        reverse=True,
+    )
+    loaded: list[dict] = []
+    for fn in candidates[:days]:
+        try:
+            with open(os.path.join(hn_dir, fn), encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                loaded.append(obj)
+        except Exception:
+            continue
+    return list(reversed(loaded))  # chronological order
+
+
+def save_daily_archive(
+    archive_dir: str,
+    day: date,
+    summary: dict,
+    stories: list[dict],
+    ask_show: list[dict] | None = None,
+) -> str:
+    """Persist a compact daily JSON archive for weekly compounding."""
+    if not archive_dir:
+        return ""
+    hn_dir = os.path.join(archive_dir, "hn")
+    os.makedirs(hn_dir, exist_ok=True)
+    out_path = os.path.join(hn_dir, f"{day.isoformat()}.json")
+    story_notes = summary.get("stories") or {}
+    payload = {
+        "date": day.isoformat(),
+        "overview": summary.get("overview", ""),
+        "trends": summary.get("trends", []),
+        "spiciest_debate": summary.get("spiciest_debate"),
+        "signals": summary.get("signals", []),
+        "stories": [
+            {
+                "object_id": s.get("object_id", ""),
+                "title": s.get("title", ""),
+                "domain": s.get("domain", ""),
+                "url": s.get("url", ""),
+                "hn_url": s.get("hn_url", ""),
+                "points": s.get("points", 0),
+                "comments": s.get("comments", 0),
+                "tldr": (story_notes.get(str(s.get("object_id", ""))) or {}).get("tldr", ""),
+                "hn_take": (story_notes.get(str(s.get("object_id", ""))) or {}).get("hn_take", ""),
+            }
+            for s in stories
+        ],
+        "ask_show": [
+            {
+                "object_id": s.get("object_id", ""),
+                "title": s.get("title", ""),
+                "hn_url": s.get("hn_url", ""),
+                "points": s.get("points", 0),
+                "comments": s.get("comments", 0),
+                "top_comments": (s.get("top_comments") or [])[:3],
+            }
+            for s in (ask_show or [])
+        ],
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    return out_path
+
+
 def find_spiciest_debate(stories: list[dict]) -> dict | None:
     """Identify the most contentious/debated story by comments-to-points ratio."""
     eligible = [s for s in stories if s["points"] >= 50 and s["comments"] >= 30]
@@ -487,12 +631,14 @@ def enrich_stories(
     spiciest: dict | None = None,
     fetch_articles: bool = True,
     comment_top_k: int = 8,
+    extra_discussions: list[dict] | None = None,
 ) -> None:
     """Concurrently enrich stories with article excerpts and top HN comments."""
     comment_ids = {s["object_id"] for s in stories[: max(0, comment_top_k)]}
     if spiciest and spiciest.get("object_id") and comment_top_k > 0:
         comment_ids.add(spiciest["object_id"])
 
+    extras = extra_discussions or []
     article_futures = {}
     comment_futures = {}
 
@@ -511,6 +657,17 @@ def enrich_stories(
             if s["object_id"] in comment_ids:
                 comment_futures[pool.submit(fetch_story_comments, s["object_id"])] = s
 
+        for ex in extras:
+            ex.setdefault("article_excerpt", "")
+            ex.setdefault("top_comments", [])
+            if ex.get("story_text"):
+                text = ex["story_text"]
+                if len(text) > MAX_ARTICLE_CHARS:
+                    text = text[:MAX_ARTICLE_CHARS].rsplit(" ", 1)[0] + "..."
+                ex["article_excerpt"] = text
+            if ex.get("object_id") and comment_top_k > 0:
+                comment_futures[pool.submit(fetch_story_comments, ex["object_id"])] = ex
+
         for fut, story in article_futures.items():
             try:
                 story["article_excerpt"] = fut.result()
@@ -525,9 +682,11 @@ def enrich_stories(
 
     articles_ok = sum(1 for s in stories if s.get("article_excerpt"))
     comments_ok = sum(1 for s in stories if s.get("top_comments"))
+    extra_ok = sum(1 for ex in extras if ex.get("top_comments"))
+    extra_msg = f" + {extra_ok}/{len(extras)} Ask/Show threads" if extras else ""
     print(
         f"Enriched {articles_ok}/{len(stories)} articles and "
-        f"{comments_ok}/{len(comment_ids)} comment threads.",
+        f"{comments_ok}/{len(comment_ids)} comment threads{extra_msg}.",
         file=sys.stderr,
     )
 
@@ -553,7 +712,12 @@ PROVIDER_PRESETS = {
 }
 
 
-def build_llm_prompt(stories: list[dict], spiciest: dict | None = None) -> tuple[str, str]:
+def build_llm_prompt(
+    stories: list[dict],
+    spiciest: dict | None = None,
+    ask_show: list[dict] | None = None,
+    recent_archives: list[dict] | None = None,
+) -> tuple[str, str]:
     """Construct the (system, user) prompts with enriched article and comment context."""
     spiciest_id = spiciest.get("object_id") if spiciest else None
     blocks: list[str] = []
@@ -582,12 +746,41 @@ def build_llm_prompt(stories: list[dict], spiciest: dict | None = None) -> tuple
                 lines.append(f"  - {c}")
         blocks.append("\n".join(lines))
 
+    continuity_section = ""
+    if recent_archives:
+        ctx_lines = ["Recent days' context (for narrative continuity — do not repeat old stories, just note multi-day arcs if relevant):"]
+        for arch in recent_archives:
+            d = arch.get("date", "")
+            ov = (arch.get("overview") or "").strip()
+            tr = "; ".join((arch.get("trends") or [])[:3])
+            if ov:
+                ctx_lines.append(f"- {d}: {ov}" + (f" [Trends: {tr}]" if tr else ""))
+        continuity_section = "\n".join(ctx_lines) + "\n\n"
+
+    ask_show_section = ""
+    if ask_show:
+        ex_blocks = [
+            "Additional Ask HN / Show HN threads (do NOT include these in the 'stories' array; use them to enrich 'overview', 'trends', and especially 'signals' for recurring pain points or unmet needs):"
+        ]
+        for ex in ask_show:
+            ex_lines = [
+                f"[ID:{ex['object_id']}] {ex['title']} — {ex['points']} pts, {ex['comments']} comments"
+            ]
+            if ex.get("article_excerpt"):
+                ex_lines.append(f"Post text: {ex['article_excerpt'][:500]}")
+            for c in (ex.get("top_comments") or [])[:4]:
+                ex_lines.append(f"  - {c}")
+            ex_blocks.append("\n".join(ex_lines))
+        ask_show_section = "\n\n" + "\n\n".join(ex_blocks) + "\n"
+
     system = (
         "You are a sharp tech-news analyst writing a concise, high-signal daily "
         "digest of Hacker News. Go beyond headlines: synthesize what the linked "
         "articles actually say and what the HN comment section actually thinks "
-        "(consensus, technical nuances, or sharp skepticism). Never invent article "
-        "details when an excerpt is unavailable. Respond ONLY with valid JSON."
+        "(consensus, technical nuances, or sharp skepticism). Also extract "
+        "reusable compounding signals (recurring engineer pain points, consensus "
+        "shifts, or contested claims) for weekly longitudinal synthesis. Never "
+        "invent article details when an excerpt is unavailable. Respond ONLY with valid JSON."
     )
 
     spiciest_instruction = (
@@ -597,13 +790,20 @@ def build_llm_prompt(stories: list[dict], spiciest: dict | None = None) -> tuple
     )
 
     user = (
-        "Here are today's top Hacker News stories with article excerpts and top comments:\n\n"
+        continuity_section
+        + "Here are today's top Hacker News stories with article excerpts and top comments:\n\n"
         + "\n\n".join(blocks)
+        + ask_show_section
         + "\n\nRespond with a JSON object with exactly these keys:\n"
-        '  "overview": a 2-3 sentence string on today\'s overall mood and dominant themes.\n'
+        '  "overview": a 2-3 sentence string on today\'s overall mood and dominant themes (note continuity with recent days if applicable).\n'
         '  "trends": an array of 3-5 short strings, each a specific trend from today.\n'
         + spiciest_instruction
-        + '  "stories": an array with one object per story above, each containing:\n'
+        + '  "signals": an array of 3-5 structured compounding atoms for weekly analysis, each an object with:\n'
+        '      "type": one of "pain_point", "consensus_shift", or "debate_claim",\n'
+        '      "topic": 2-4 word topic tag,\n'
+        '      "summary": 1 crisp sentence capturing the specific friction, shift, or claim,\n'
+        '      "story_id": the exact ID string from [ID:...] that best evidences it.\n'
+        '  "stories": an array with one object per main top story above, each containing:\n'
         '      "story_id": the exact ID string from [ID:...],\n'
         '      "tldr": 1 crisp sentence explaining what the link actually is or argues,\n'
         '      "hn_take": 1 crisp sentence summarizing comment consensus or top pushback ("" if no comments were provided).\n'
@@ -612,7 +812,13 @@ def build_llm_prompt(stories: list[dict], spiciest: dict | None = None) -> tuple
     return system, user
 
 
-def call_llm(system: str, user: str) -> str:
+def call_llm(
+    system: str,
+    user: str,
+    *,
+    reasoning_effort: str | None = None,
+    timeout: int | None = None,
+) -> str:
     """Call an OpenAI-compatible chat/completions endpoint with retry/backoff."""
     provider = (os.environ.get("LLM_PROVIDER") or "openai").lower()
     if provider not in PROVIDER_PRESETS:
@@ -634,38 +840,67 @@ def call_llm(system: str, user: str) -> str:
     if not model:
         raise SystemExit("LLM_MODEL is required for this provider.")
 
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.4,
-            "response_format": {"type": "json_object"},
-        }
-    ).encode()
+    req_timeout = timeout if timeout is not None else _env_int("LLM_TIMEOUT", 180)
+    env_effort = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
+    effort = env_effort or (reasoning_effort or "").strip().lower()
+    if not effort and provider == "gemini":
+        # Gemini 3.x thinking models default to MEDIUM; 'low' avoids 120s+ daily timeouts.
+        effort = "low"
 
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    body_dict: dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.4,
+        "response_format": {"type": "json_object"},
+    }
+    if effort and effort != "default":
+        body_dict["reasoning_effort"] = effort
+
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    def _make_req() -> urllib.request.Request:
+        return urllib.request.Request(
+            endpoint,
+            data=json.dumps(body_dict).encode(),
+            headers=headers,
+            method="POST",
+        )
+
+    req = _make_req()
 
     # Retry transient errors (rate limit / server overload / timeout) with backoff.
     transient = {429, 500, 502, 503, 504}
     max_attempts = 5
+    dropped_reasoning = False
     for attempt in range(1, max_attempts + 1):
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=req_timeout) as resp:
                 data = json.load(resp)
             break
         except urllib.error.HTTPError as e:
             body = e.read().decode()[:500]
+            # Fail-soft if an endpoint/model rejects reasoning_effort with HTTP 400.
+            if (
+                e.code == 400
+                and "reasoning_effort" in body_dict
+                and not dropped_reasoning
+                and ("reasoning" in body.lower() or "thinking" in body.lower() or "unknown" in body.lower())
+            ):
+                print(
+                    "LLM rejected reasoning_effort; retrying without it...",
+                    file=sys.stderr,
+                )
+                body_dict.pop("reasoning_effort", None)
+                dropped_reasoning = True
+                req = _make_req()
+                continue
             if e.code in transient and attempt < max_attempts:
                 wait = min(2 ** attempt, 30)
                 print(
@@ -691,8 +926,18 @@ def call_llm(system: str, user: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-def summarize_with_llm(stories: list[dict], spiciest: dict | None = None) -> dict:
-    system, user = build_llm_prompt(stories, spiciest=spiciest)
+def summarize_with_llm(
+    stories: list[dict],
+    spiciest: dict | None = None,
+    ask_show: list[dict] | None = None,
+    recent_archives: list[dict] | None = None,
+) -> dict:
+    system, user = build_llm_prompt(
+        stories,
+        spiciest=spiciest,
+        ask_show=ask_show,
+        recent_archives=recent_archives,
+    )
     content = call_llm(system, user)
     return parse_summary(content)
 
@@ -707,6 +952,7 @@ def parse_summary(content: str) -> dict:
             "overview": content,
             "trends": [],
             "spiciest_debate": None,
+            "signals": [],
             "stories": {},
         }
 
@@ -720,6 +966,26 @@ def parse_summary(content: str) -> dict:
         debate_summary = str(raw_debate.get("summary", "")).strip()
         if debate_id and debate_summary:
             spiciest_debate = {"story_id": debate_id, "summary": debate_summary}
+
+    valid_types = {"pain_point", "consensus_shift", "debate_claim"}
+    signals: list[dict[str, str]] = []
+    for entry in obj.get("signals") or []:
+        if not isinstance(entry, dict):
+            continue
+        sig_summary = str(entry.get("summary", "")).strip()
+        if not sig_summary:
+            continue
+        sig_type = str(entry.get("type", "debate_claim")).strip().lower()
+        if sig_type not in valid_types:
+            sig_type = "debate_claim"
+        signals.append(
+            {
+                "type": sig_type,
+                "topic": str(entry.get("topic", "")).strip(),
+                "summary": sig_summary,
+                "story_id": str(entry.get("story_id", "")).strip(),
+            }
+        )
 
     story_notes: dict[str, dict[str, str]] = {}
     raw_stories = obj.get("stories")
@@ -747,6 +1013,7 @@ def parse_summary(content: str) -> dict:
         "overview": overview,
         "trends": trends,
         "spiciest_debate": spiciest_debate,
+        "signals": signals,
         "stories": story_notes,
     }
 
@@ -951,6 +1218,8 @@ def main() -> int:
     state_file = (os.environ.get("STATE_FILE") or "state/seen.json").strip()
     fetch_articles = _env_bool("FETCH_ARTICLES", True)
     comment_top_k = _env_int("COMMENT_TOP_K", 8)
+    ask_show_n = _env_int("ASK_SHOW_N", 3)
+    archive_dir = (os.environ.get("ARCHIVE_DIR") or "").strip()
 
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%A, %d %B %Y (UTC)")
@@ -958,6 +1227,17 @@ def main() -> int:
     seen_map = load_seen_ids(state_file, today=now.date()) if dedup_enabled else {}
     if seen_map:
         print(f"Loaded {len(seen_map)} recently seen story IDs.", file=sys.stderr)
+
+    recent_archives = (
+        load_recent_daily_archives(archive_dir, days=3, before_date=now.date())
+        if archive_dir
+        else []
+    )
+    if recent_archives:
+        print(
+            f"Loaded {len(recent_archives)} recent daily archive(s) for continuity.",
+            file=sys.stderr,
+        )
 
     print(
         f"Fetching top {top_n} Hacker News stories (mode={fetch_mode})...",
@@ -970,6 +1250,10 @@ def main() -> int:
     )
     if not stories:
         raise SystemExit("No stories returned from Hacker News.")
+
+    story_ids = {s["object_id"] for s in stories if s.get("object_id")}
+    exclude_for_ask = story_ids | (set(seen_map.keys()) if dedup_enabled else set())
+    ask_show = fetch_ask_show_stories(limit=ask_show_n, exclude_ids=exclude_for_ask)
 
     spiciest = find_spiciest_debate(stories)
     if spiciest:
@@ -984,10 +1268,16 @@ def main() -> int:
         spiciest=spiciest,
         fetch_articles=fetch_articles,
         comment_top_k=comment_top_k,
+        extra_discussions=ask_show,
     )
 
     print(f"Summarizing {len(stories)} stories with the LLM...", file=sys.stderr)
-    summary = summarize_with_llm(stories, spiciest=spiciest)
+    summary = summarize_with_llm(
+        stories,
+        spiciest=spiciest,
+        ask_show=ask_show,
+        recent_archives=recent_archives,
+    )
 
     html = render_html(summary, stories, date_str)
     text = render_text(summary, stories, date_str)
@@ -999,6 +1289,16 @@ def main() -> int:
     else:
         print("SMTP not configured — printing digest below.\n", file=sys.stderr)
         print(text)
+
+    if archive_dir:
+        out_path = save_daily_archive(
+            archive_dir,
+            now.date(),
+            summary,
+            stories,
+            ask_show=ask_show,
+        )
+        print(f"Saved daily archive to {out_path}.", file=sys.stderr)
 
     if dedup_enabled and state_file:
         save_seen_ids(

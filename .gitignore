@@ -13,3 +13,6 @@ venv/
 
 # Runtime dedup state (persisted via GitHub Actions cache)
 state/
+
+# Local data-branch archive worktree
+.data/

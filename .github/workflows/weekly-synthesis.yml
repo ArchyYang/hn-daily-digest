@@ -1,0 +1,82 @@
+name: Weekly Tech Signal & Angles
+
+on:
+  schedule:
+    # 14:00 UTC every Sunday. Adjust as you like.
+    - cron: "0 14 * * 0"
+  workflow_dispatch:  # allow manual runs anytime (uses 7-day Algolia bootstrap if <3 daily archives exist)
+
+permissions:
+  contents: write  # push weekly JSON syntheses to the orphan `data` branch
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Checkout data branch into .data
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch --depth=1 origin data
+            git worktree add .data FETCH_HEAD
+          else
+            mkdir -p .data
+          fi
+
+      - name: Synthesize and email weekly brief
+        env:
+          # --- LLM ---
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}                        # openai | gemini | custom
+          LLM_MODEL: ${{ vars.LLM_MODEL }}                              # optional override
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}                        # only for provider=custom
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          WEEKLY_REASONING_EFFORT: ${{ vars.WEEKLY_REASONING_EFFORT }}  # optional, default medium
+          WEEKLY_LLM_TIMEOUT: ${{ vars.WEEKLY_LLM_TIMEOUT }}            # optional, default 240
+          # --- Sources & Archive ---
+          ARCHIVE_DIR: .data
+          WATCHLIST_FILE: watchlist.json
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- Optional Notion export ---
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          # --- Email (SMTP) ---
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_STARTTLS: ${{ vars.SMTP_STARTTLS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python weekly_synthesis.py
+
+      - name: Commit and push weekly archive to data branch
+        run: |
+          if [ -z "$(find .data -maxdepth 3 -name '*.json' -print -quit 2>/dev/null)" ]; then
+            echo "No archive files to commit."
+            exit 0
+          fi
+          if [ ! -e .data/.git ]; then
+            git -C .data init -b data
+            git -C .data remote add origin "$(git remote get-url origin)"
+          fi
+          git -C .data config user.name "github-actions[bot]"
+          git -C .data config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C .data add -A
+          if git -C .data diff --cached --quiet; then
+            echo "No archive changes."
+            exit 0
+          fi
+          git -C .data commit -m "Archive: Weekly synthesis $(date -u +%Y-%m-%d)"
+          AUTH_HEADER="$(git config --local --get http.https://github.com/.extraheader || true)"
+          if [ -n "$AUTH_HEADER" ]; then
+            git -C .data -c "http.https://github.com/.extraheader=$AUTH_HEADER" push origin HEAD:refs/heads/data
+          else
+            git -C .data push origin HEAD:refs/heads/data
+          fi

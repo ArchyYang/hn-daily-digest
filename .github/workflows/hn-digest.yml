@@ -7,7 +7,7 @@ on:
   workflow_dispatch:  # allow manual runs from the Actions tab
 
 permissions:
-  contents: read
+  contents: write  # push daily JSON archives to the orphan `data` branch
 
 jobs:
   digest:
@@ -21,6 +21,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Checkout data branch into .data
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch --depth=1 origin data
+            git worktree add .data FETCH_HEAD
+          else
+            mkdir -p .data
+          fi
+
       - name: Restore seen stories cache
         uses: actions/cache/restore@v4
         with:
@@ -32,16 +41,20 @@ jobs:
       - name: Generate and email the digest
         env:
           # --- LLM ---
-          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}      # openai | gemini | custom
-          LLM_MODEL: ${{ vars.LLM_MODEL }}            # optional override
-          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}      # only for provider=custom
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}                  # openai | gemini | custom
+          LLM_MODEL: ${{ vars.LLM_MODEL }}                        # optional override
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}                  # only for provider=custom
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_REASONING_EFFORT: ${{ vars.LLM_REASONING_EFFORT }}  # optional, defaults to low for gemini
+          LLM_TIMEOUT: ${{ vars.LLM_TIMEOUT }}                    # optional, default 180
           # --- Digest & Enrichment ---
-          TOP_N: ${{ vars.TOP_N }}                    # optional, default 15
-          FETCH_MODE: ${{ vars.FETCH_MODE }}          # optional, 24h (default) | front_page
-          DEDUP_ENABLED: ${{ vars.DEDUP_ENABLED }}    # optional, default true
-          FETCH_ARTICLES: ${{ vars.FETCH_ARTICLES }}  # optional, default true
-          COMMENT_TOP_K: ${{ vars.COMMENT_TOP_K }}    # optional, default 8
+          TOP_N: ${{ vars.TOP_N }}                                # optional, default 15
+          FETCH_MODE: ${{ vars.FETCH_MODE }}                      # optional, 24h (default) | front_page
+          DEDUP_ENABLED: ${{ vars.DEDUP_ENABLED }}                # optional, default true
+          FETCH_ARTICLES: ${{ vars.FETCH_ARTICLES }}              # optional, default true
+          COMMENT_TOP_K: ${{ vars.COMMENT_TOP_K }}                # optional, default 8
+          ASK_SHOW_N: ${{ vars.ASK_SHOW_N }}                      # optional, default 3
+          ARCHIVE_DIR: .data
           # --- Email (SMTP) ---
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -58,3 +71,28 @@ jobs:
         with:
           path: state/seen.json
           key: hn-seen-${{ github.run_id }}
+
+      - name: Commit and push daily archive to data branch
+        run: |
+          if [ -z "$(find .data -maxdepth 3 -name '*.json' -print -quit 2>/dev/null)" ]; then
+            echo "No archive files to commit."
+            exit 0
+          fi
+          if [ ! -e .data/.git ]; then
+            git -C .data init -b data
+            git -C .data remote add origin "$(git remote get-url origin)"
+          fi
+          git -C .data config user.name "github-actions[bot]"
+          git -C .data config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C .data add -A
+          if git -C .data diff --cached --quiet; then
+            echo "No archive changes."
+            exit 0
+          fi
+          git -C .data commit -m "Archive: HN daily $(date -u +%Y-%m-%d)"
+          AUTH_HEADER="$(git config --local --get http.https://github.com/.extraheader || true)"
+          if [ -n "$AUTH_HEADER" ]; then
+            git -C .data -c "http.https://github.com/.extraheader=$AUTH_HEADER" push origin HEAD:refs/heads/data
+          else
+            git -C .data push origin HEAD:refs/heads/data
+          fi

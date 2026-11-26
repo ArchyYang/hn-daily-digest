@@ -1,0 +1,15 @@
+{
+  "description": "High-velocity developer and AI repos monitored for top-reacted open GitHub issues in weekly_synthesis.py. Edit freely.",
+  "repos": [
+    "anthropics/claude-code",
+    "ollama/ollama",
+    "vllm-project/vllm",
+    "modelcontextprotocol/servers",
+    "zed-industries/zed",
+    "duckdb/duckdb",
+    "astral-sh/uv",
+    "oven-sh/bun",
+    "vercel/ai",
+    "supabase/supabase"
+  ]
+}

@@ -32,10 +32,12 @@ jobs:
       - name: Generate and email GitHub Trending digest
         env:
           # --- LLM ---
-          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}          # openai | gemini | custom
-          LLM_MODEL: ${{ vars.LLM_MODEL }}                # optional override
-          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}          # only for provider=custom
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}                  # openai | gemini | custom
+          LLM_MODEL: ${{ vars.LLM_MODEL }}                        # optional override
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}                  # only for provider=custom
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_REASONING_EFFORT: ${{ vars.LLM_REASONING_EFFORT }}  # optional, defaults to low for gemini
+          LLM_TIMEOUT: ${{ vars.LLM_TIMEOUT }}                    # optional, default 180
           # --- GitHub Trending ---
           GH_TOP_N: ${{ vars.GH_TOP_N }}                  # optional, default 10
           GH_LANGUAGE: ${{ vars.GH_LANGUAGE }}            # optional, e.g. python, rust
