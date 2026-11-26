@@ -455,7 +455,8 @@ def summarize_with_llm(
     since: str = "daily",
 ) -> dict:
     system, user = build_llm_prompt(repos, breakout=breakout, since=since)
-    content = call_llm(system, user)
+    # GitHub Trending summaries are lightweight; always pin reasoning effort to 'low'.
+    content = call_llm(system, user, reasoning_effort="low")
     return parse_summary(content)
 
 

@@ -36,7 +36,6 @@ jobs:
           LLM_MODEL: ${{ vars.LLM_MODEL }}                        # optional override
           LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}                  # only for provider=custom
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_REASONING_EFFORT: ${{ vars.LLM_REASONING_EFFORT }}  # optional, defaults to low for gemini
           LLM_TIMEOUT: ${{ vars.LLM_TIMEOUT }}                    # optional, default 180
           LLM_FALLBACK_MODELS: ${{ vars.LLM_FALLBACK_MODELS }}    # optional, defaults to gemini-3.5-flash-lite for gemini
           # --- GitHub Trending ---

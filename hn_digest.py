@@ -871,7 +871,7 @@ def call_llm(
 
     req_timeout = timeout if timeout is not None else _env_int("LLM_TIMEOUT", 180)
     env_effort = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
-    base_effort = env_effort or (reasoning_effort or "").strip().lower()
+    base_effort = (reasoning_effort or "").strip().lower() or env_effort
     if not base_effort and provider == "gemini":
         # Gemini 3.x thinking models default to MEDIUM; 'low' avoids 120s+ daily timeouts.
         base_effort = "low"

@@ -185,6 +185,16 @@ class TestParsingAndRendering(unittest.TestCase):
         self.assertIn("IDEA SPARK", text)
         self.assertIn("zero-ops local analytics dashboard", text)
 
+    def test_summarize_always_pins_low_reasoning_effort(self):
+        repos = gh_trending.parse_trending_html(SAMPLE_TRENDING_HTML)
+        with patch.object(
+            gh_trending,
+            "call_llm",
+            return_value=json.dumps({"overview": "ok", "themes": [], "repos": []}),
+        ) as mocked:
+            gh_trending.summarize_with_llm(repos)
+        self.assertEqual(mocked.call_args.kwargs.get("reasoning_effort"), "low")
+
 
 if __name__ == "__main__":
     unittest.main()
