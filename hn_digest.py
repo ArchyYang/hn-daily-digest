@@ -20,6 +20,7 @@ Configuration is via environment variables (see README.md):
   ARCHIVE_DIR     optional dir for daily JSON archive (e.g. .data)
   LLM_REASONING_EFFORT  minimal|low|medium|high     (default: low for gemini)
   LLM_TIMEOUT     HTTP read timeout in seconds      (default: 180)
+  LLM_FALLBACK_MODELS  comma-separated fallback models on 429/503/timeout
 
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS        (required to email)
   EMAIL_FROM, EMAIL_TO                               (required to email)
@@ -699,15 +700,18 @@ PROVIDER_PRESETS = {
     "openai": {
         "base_url": "https://api.openai.com/v1",
         "default_model": "gpt-4o-mini",
+        "fallback_models": [],
     },
     "gemini": {
         # Google's OpenAI-compatible endpoint.
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "default_model": "gemini-3.8-flash",
+        "fallback_models": ["gemini-3.5-flash-lite"],
     },
     "custom": {
         "base_url": None,  # must be supplied via LLM_BASE_URL
         "default_model": None,
+        "fallback_models": [],
     },
 }
 
@@ -812,6 +816,20 @@ def build_llm_prompt(
     return system, user
 
 
+def _parse_retry_after(headers) -> int | None:
+    """Parse numeric Retry-After header if present, clamped to [1, 60]."""
+    if not headers:
+        return None
+    raw = headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        secs = int(float(str(raw).strip()))
+        return max(1, min(secs, 60))
+    except ValueError:
+        return None
+
+
 def call_llm(
     system: str,
     user: str,
@@ -819,7 +837,7 @@ def call_llm(
     reasoning_effort: str | None = None,
     timeout: int | None = None,
 ) -> str:
-    """Call an OpenAI-compatible chat/completions endpoint with retry/backoff."""
+    """Call an OpenAI-compatible chat/completions endpoint with retry/backoff & fallback."""
     provider = (os.environ.get("LLM_PROVIDER") or "openai").lower()
     if provider not in PROVIDER_PRESETS:
         raise SystemExit(
@@ -836,28 +854,27 @@ def call_llm(
         raise SystemExit(
             "LLM_BASE_URL is required when LLM_PROVIDER=custom."
         )
-    model = os.environ.get("LLM_MODEL") or preset["default_model"]
-    if not model:
+    primary_model = os.environ.get("LLM_MODEL") or preset["default_model"]
+    if not primary_model:
         raise SystemExit("LLM_MODEL is required for this provider.")
+
+    # Build ordered model chain: primary + optional fallback models on 429/503/timeout.
+    raw_fallbacks = (os.environ.get("LLM_FALLBACK_MODELS") or "").strip()
+    if raw_fallbacks.lower() in {"none", "off", "false"}:
+        fallbacks: list[str] = []
+    elif raw_fallbacks:
+        fallbacks = [m.strip() for m in raw_fallbacks.split(",") if m.strip()]
+    else:
+        fallbacks = list(preset.get("fallback_models") or [])
+
+    model_chain = [primary_model] + [m for m in fallbacks if m != primary_model]
 
     req_timeout = timeout if timeout is not None else _env_int("LLM_TIMEOUT", 180)
     env_effort = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
-    effort = env_effort or (reasoning_effort or "").strip().lower()
-    if not effort and provider == "gemini":
+    base_effort = env_effort or (reasoning_effort or "").strip().lower()
+    if not base_effort and provider == "gemini":
         # Gemini 3.x thinking models default to MEDIUM; 'low' avoids 120s+ daily timeouts.
-        effort = "low"
-
-    body_dict: dict = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.4,
-        "response_format": {"type": "json_object"},
-    }
-    if effort and effort != "default":
-        body_dict["reasoning_effort"] = effort
+        base_effort = "low"
 
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
@@ -865,65 +882,120 @@ def call_llm(
         "Content-Type": "application/json",
     }
 
-    def _make_req() -> urllib.request.Request:
-        return urllib.request.Request(
-            endpoint,
-            data=json.dumps(body_dict).encode(),
-            headers=headers,
-            method="POST",
-        )
-
-    req = _make_req()
-
-    # Retry transient errors (rate limit / server overload / timeout) with backoff.
     transient = {429, 500, 502, 503, 504}
-    max_attempts = 5
-    dropped_reasoning = False
-    for attempt in range(1, max_attempts + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=req_timeout) as resp:
-                data = json.load(resp)
-            break
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()[:500]
-            # Fail-soft if an endpoint/model rejects reasoning_effort with HTTP 400.
-            if (
-                e.code == 400
-                and "reasoning_effort" in body_dict
-                and not dropped_reasoning
-                and ("reasoning" in body.lower() or "thinking" in body.lower() or "unknown" in body.lower())
-            ):
-                print(
-                    "LLM rejected reasoning_effort; retrying without it...",
-                    file=sys.stderr,
-                )
-                body_dict.pop("reasoning_effort", None)
-                dropped_reasoning = True
-                req = _make_req()
-                continue
-            if e.code in transient and attempt < max_attempts:
-                wait = min(2 ** attempt, 30)
-                print(
-                    f"LLM {e.code} (attempt {attempt}/{max_attempts}); "
-                    f"retrying in {wait}s...",
-                    file=sys.stderr,
-                )
-                time.sleep(wait)
-                continue
-            raise SystemExit(f"LLM request failed ({e.code}): {body}")
-        except (urllib.error.URLError, TimeoutError) as e:
-            reason = e.reason if isinstance(e, urllib.error.URLError) else e
-            if attempt < max_attempts:
-                wait = min(2 ** attempt, 30)
-                print(
-                    f"LLM connection error ({reason}); retrying in {wait}s...",
-                    file=sys.stderr,
-                )
-                time.sleep(wait)
-                continue
-            raise SystemExit(f"LLM request failed: {reason}")
+    last_error = "unknown error"
 
-    return data["choices"][0]["message"]["content"].strip()
+    for model_idx, model in enumerate(model_chain):
+        is_last_model = model_idx == len(model_chain) - 1
+        effort = base_effort
+        body_dict: dict = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.4,
+            "response_format": {"type": "json_object"},
+        }
+        if effort and effort != "default":
+            body_dict["reasoning_effort"] = effort
+
+        def _make_req() -> urllib.request.Request:
+            return urllib.request.Request(
+                endpoint,
+                data=json.dumps(body_dict).encode(),
+                headers=headers,
+                method="POST",
+            )
+
+        req = _make_req()
+        max_attempts = 5 if model_idx == 0 else 3
+        dropped_reasoning = False
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=req_timeout) as resp:
+                    data = json.load(resp)
+                if model_idx > 0:
+                    print(f"LLM fallback succeeded using '{model}'.", file=sys.stderr)
+                return data["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError as e:
+                body = e.read().decode()[:500]
+                # Fail-soft if an endpoint/model rejects reasoning_effort with HTTP 400.
+                if (
+                    e.code == 400
+                    and "reasoning_effort" in body_dict
+                    and not dropped_reasoning
+                    and ("reasoning" in body.lower() or "thinking" in body.lower() or "unknown" in body.lower())
+                ):
+                    print(
+                        "LLM rejected reasoning_effort; retrying without it...",
+                        file=sys.stderr,
+                    )
+                    body_dict.pop("reasoning_effort", None)
+                    dropped_reasoning = True
+                    req = _make_req()
+                    continue
+                last_error = f"LLM request failed ({e.code}): {body}"
+                if e.code in transient and attempt < max_attempts:
+                    retry_after = _parse_retry_after(e.headers)
+                    # Wider backoff on 429/503 high-demand spikes (5, 10, 20, 40s).
+                    default_wait = (
+                        min(5 * (2 ** (attempt - 1)), 60)
+                        if e.code in {429, 503}
+                        else min(2 ** attempt, 30)
+                    )
+                    wait = retry_after if retry_after is not None else default_wait
+                    print(
+                        f"LLM {e.code} on '{model}' (attempt {attempt}/{max_attempts}); "
+                        f"retrying in {wait}s...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait)
+                    continue
+                if e.code in transient and not is_last_model:
+                    next_model = model_chain[model_idx + 1]
+                    print(
+                        f"Model '{model}' unavailable ({e.code}); "
+                        f"falling back to '{next_model}'...",
+                        file=sys.stderr,
+                    )
+                    break
+                raise SystemExit(last_error)
+            except (urllib.error.URLError, TimeoutError) as e:
+                reason = e.reason if isinstance(e, urllib.error.URLError) else e
+                last_error = f"LLM request failed: {reason}"
+                if attempt < max_attempts:
+                    # If a medium/high thinking call timed out, step down to 'low' on retry.
+                    if (
+                        isinstance(e, TimeoutError)
+                        and body_dict.get("reasoning_effort") in {"medium", "high"}
+                    ):
+                        print(
+                            f"Timeout on '{model}' with reasoning_effort={body_dict['reasoning_effort']}; "
+                            "stepping down to 'low' for retry...",
+                            file=sys.stderr,
+                        )
+                        body_dict["reasoning_effort"] = "low"
+                        req = _make_req()
+                    wait = min(2 ** attempt, 30)
+                    print(
+                        f"LLM connection error ({reason}); retrying in {wait}s...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait)
+                    continue
+                if not is_last_model:
+                    next_model = model_chain[model_idx + 1]
+                    print(
+                        f"Model '{model}' timed out/unreachable; "
+                        f"falling back to '{next_model}'...",
+                        file=sys.stderr,
+                    )
+                    break
+                raise SystemExit(last_error)
+
+    raise SystemExit(last_error)
 
 
 def summarize_with_llm(

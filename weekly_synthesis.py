@@ -46,8 +46,12 @@ from hn_digest import (
 
 LOBSTERS_HOTTEST = "https://lobste.rs/hottest.json"
 GH_ISSUE_SEARCH = "https://api.github.com/search/issues"
-NOTION_PAGES_API = "https://api.notion.com/v1/pages"
-NOTION_VERSION = "2022-06-28"
+NOTION_API_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2025-09-03"
+NOTION_LEGACY_VERSION = "2022-06-28"
+
+ACTIVE_NOTION_STATUSES = {"drafting", "building", "starred", "in progress", "writing"}
+DISMISSED_NOTION_STATUSES = {"dismissed", "rejected", "ignored"}
 
 DEFAULT_WATCHLIST = [
     "anthropics/claude-code",
@@ -432,8 +436,28 @@ def build_weekly_prompt(
     lobsters: list[dict],
     issues: list[dict],
     overlaps: list[dict],
+    active_notion_cards: list[dict] | None = None,
+    dismissed_titles: list[str] | None = None,
 ) -> tuple[str, str]:
     sections: list[str] = []
+
+    if active_notion_cards:
+        nc_lines = [
+            "USER'S ACTIVE NOTION DRAFTS & PROJECTS (two-way memory — if anything this week genuinely strengthens, updates, or challenges one of these, add an entry to 'active_card_updates'; skip if no strong match):"
+        ]
+        for card in active_notion_cards[:10]:
+            nc_lines.append(
+                f"- [PAGE_ID:{card['page_id']}] ({card.get('status') or 'Active'}"
+                + (f", {card['card_type']}" if card.get("card_type") else "")
+                + f") {card['title']}"
+            )
+        sections.append("\n".join(nc_lines))
+
+    if dismissed_titles:
+        sections.append(
+            "TOPICS USER PREVIOUSLY DISMISSED IN NOTION (avoid re-pitching these unless something major changed):\n"
+            + "\n".join(f"- {t}" for t in dismissed_titles[:15])
+        )
 
     if prior_weeks:
         pw_lines = ["PRIOR WEEKS' SYNTHESES (compare against these to detect what persisted vs. faded):"]
@@ -533,6 +557,13 @@ def build_weekly_prompt(
         "below. Never fabricate URLs or stats. Respond ONLY with valid JSON."
     )
 
+    active_update_instruction = (
+        '  "active_card_updates": array of objects ONLY for active Notion cards above that received genuinely relevant new evidence this week (empty array [] if none): '
+        '{"page_id": "exact PAGE_ID from input", "relevance_summary": "1-2 sentences explaining how this week\'s threads/issues strengthen, update, or challenge the draft/project", "links": [{"label": "source title", "url": "exact URL from input"}]}.\n'
+        if active_notion_cards
+        else '  "active_card_updates": [],\n'
+    )
+
     user = (
         f"Week: {week_id}\n\n"
         + "\n\n".join(sections)
@@ -545,7 +576,8 @@ def build_weekly_prompt(
         '      {"problem": "1 crisp sentence stating the friction", "proof": "specific citation of Ask/Show HN comments or GitHub issue +1 count", "url": "exact URL from input", "build_angle": "1-2 sentences on a focused weekend tool, plugin, or benchmark that addresses it"}.\n'
         '  "cross_platform_highlights": array of up to 4 notable items converging across HN, Lobste.rs, or GitHub, each:\n'
         '      {"title": "...", "url": "exact URL from input", "why_it_mattered": "1 crisp sentence"}.\n'
-        "Plain text only inside all strings (no markdown)."
+        + active_update_instruction
+        + "Plain text only inside all strings (no markdown)."
     )
     return system, user
 
@@ -562,6 +594,7 @@ def parse_weekly_summary(content: str) -> dict:
             "article_pitches": [],
             "validated_pain_points": [],
             "cross_platform_highlights": [],
+            "active_card_updates": [],
         }
 
     pvf = []
@@ -633,12 +666,38 @@ def parse_weekly_summary(content: str) -> dict:
             }
         )
 
+    active_updates = []
+    for entry in obj.get("active_card_updates") or []:
+        if not isinstance(entry, dict):
+            continue
+        pid = str(entry.get("page_id", "")).strip()
+        rel = str(entry.get("relevance_summary", "")).strip()
+        if not (pid and rel):
+            continue
+        links = []
+        for lk in entry.get("links") or []:
+            if isinstance(lk, dict) and lk.get("url"):
+                links.append(
+                    {
+                        "label": str(lk.get("label") or lk.get("url")).strip(),
+                        "url": str(lk.get("url")).strip(),
+                    }
+                )
+        active_updates.append(
+            {
+                "page_id": pid,
+                "relevance_summary": rel,
+                "links": links,
+            }
+        )
+
     return {
         "week_in_one_take": str(obj.get("week_in_one_take", "")).strip(),
         "persisted_vs_faded": pvf,
         "article_pitches": pitches,
         "validated_pain_points": pains,
         "cross_platform_highlights": highlights,
+        "active_card_updates": active_updates,
     }
 
 
@@ -650,6 +709,8 @@ def summarize_weekly(
     lobsters: list[dict],
     issues: list[dict],
     overlaps: list[dict],
+    active_notion_cards: list[dict] | None = None,
+    dismissed_titles: list[str] | None = None,
 ) -> dict:
     system, user = build_weekly_prompt(
         week_id,
@@ -659,9 +720,11 @@ def summarize_weekly(
         lobsters=lobsters,
         issues=issues,
         overlaps=overlaps,
+        active_notion_cards=active_notion_cards,
+        dismissed_titles=dismissed_titles,
     )
-    # Deeper synthesis benefits from medium thinking and a generous timeout.
-    weekly_timeout = _env_int("WEEKLY_LLM_TIMEOUT", 240)
+    # Deeper synthesis benefits from medium thinking (auto-steps down to 'low' on timeout).
+    weekly_timeout = _env_int("WEEKLY_LLM_TIMEOUT", 180)
     weekly_effort = (os.environ.get("WEEKLY_REASONING_EFFORT") or "medium").strip().lower()
     content = call_llm(
         system,
@@ -683,8 +746,51 @@ _STATUS_STYLES = {
 }
 
 
-def render_weekly_html(summary: dict, week_id: str, date_str: str, meta: dict) -> str:
+def render_weekly_html(
+    summary: dict,
+    week_id: str,
+    date_str: str,
+    meta: dict,
+    active_cards: list[dict] | None = None,
+) -> str:
     take_html = escape(summary.get("week_in_one_take", "")).replace("\n", "<br>")
+
+    # 0. Updates for Active Notion Drafts (when two-way memory matched)
+    active_html = ""
+    active_by_id = {c["page_id"]: c for c in (active_cards or [])}
+    updates = [
+        u for u in (summary.get("active_card_updates") or []) if u["page_id"] in active_by_id
+    ]
+    if updates:
+        u_items = []
+        for u in updates:
+            card = active_by_id[u["page_id"]]
+            link_html = " &middot; ".join(
+                f'<a href="{escape(lk["url"])}" style="color:#6d28d9;text-decoration:none;">'
+                f'{escape(lk["label"])}</a>'
+                for lk in u.get("links") or []
+            )
+            u_items.append(
+                f'<div style="margin-top:8px;">'
+                f'<strong style="color:#3b0764;">{escape(card["title"])}</strong> '
+                f'<span style="font-size:11px;color:#7c3aed;">({escape(card.get("status") or "Active")})</span>'
+                f'<div style="font-size:13.5px;line-height:1.5;color:#1e293b;margin-top:2px;">'
+                f'{escape(u["relevance_summary"])}</div>'
+                + (
+                    f'<div style="font-size:12px;color:#64748b;margin-top:3px;">{link_html}</div>'
+                    if link_html
+                    else ""
+                )
+                + "</div>"
+            )
+        active_html = (
+            '<div style="margin:0 20px 18px;padding:12px 16px;background:#faf5ff;'
+            'border-left:3px solid #7c3aed;border-radius:8px;">'
+            '<div style="font-size:11.5px;font-weight:700;color:#6d28d9;text-transform:uppercase;'
+            'letter-spacing:.6px;">Follow-Up Evidence Added to Your Active Notion Drafts</div>'
+            + "".join(u_items)
+            + "</div>"
+        )
 
     # 1. Persisted vs Faded
     pvf_html = ""
@@ -838,6 +944,7 @@ def render_weekly_html(summary: dict, week_id: str, date_str: str, meta: dict) -
     <div style="padding:20px;font-size:15px;line-height:1.6;color:#0f172a;">
       {take_html}
     </div>
+    {active_html}
     {pvf_html}
     {pitches_html}
     {pains_html}
@@ -897,92 +1004,446 @@ def render_weekly_text(summary: dict, week_id: str, date_str: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Optional Notion export (zero external deps)
+# Notion Kanban Board & Two-Way Memory (zero external deps, API 2025-09-03)
 # --------------------------------------------------------------------------- #
 
-def build_notion_payload(database_id: str, week_id: str, summary: dict) -> dict:
-    """Build a Notion API /v1/pages payload for a weekly brief."""
-    def _rt(text: str, *, bold: bool = False, url: str | None = None) -> dict:
-        obj: dict = {"type": "text", "text": {"content": text[:1900]}}
-        if url:
-            obj["text"]["link"] = {"url": url}
-        if bold:
-            obj["annotations"] = {"bold": True}
-        return obj
+def _rt(text: str, *, bold: bool = False, url: str | None = None) -> dict:
+    obj: dict = {"type": "text", "text": {"content": text[:1900]}}
+    if url:
+        obj["text"]["link"] = {"url": url}
+    if bold:
+        obj["annotations"] = {"bold": True}
+    return obj
 
-    def _h2(text: str) -> dict:
-        return {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [_rt(text)]}}
 
-    def _p(rich_text: list[dict]) -> dict:
-        return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": rich_text}}
+def _block_h2(text: str) -> dict:
+    return {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [_rt(text)]}}
 
-    def _bullet(rich_text: list[dict]) -> dict:
-        return {
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": rich_text},
+
+def _block_p(rich_text: list[dict]) -> dict:
+    return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": rich_text}}
+
+
+def _block_bullet(rich_text: list[dict]) -> dict:
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": rich_text},
+    }
+
+
+def _block_callout(rich_text: list[dict], emoji: str = "💡") -> dict:
+    return {
+        "object": "block",
+        "type": "callout",
+        "callout": {
+            "rich_text": rich_text,
+            "icon": {"type": "emoji", "emoji": emoji},
+        },
+    }
+
+
+def _block_todo(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "to_do",
+        "to_do": {"rich_text": [_rt(text)], "checked": False},
+    }
+
+
+def _block_toggle(title: str, children: list[dict]) -> dict:
+    return {
+        "object": "block",
+        "type": "toggle",
+        "toggle": {
+            "rich_text": [_rt(title, bold=True)],
+            "children": children,
+        },
+    }
+
+
+def _extract_notion_prop_text(prop: dict | None) -> str:
+    """Extract a plain string from any common Notion property object."""
+    if not isinstance(prop, dict):
+        return ""
+    ptype = prop.get("type")
+    if ptype == "title":
+        return "".join(t.get("plain_text", "") for t in prop.get("title") or []).strip()
+    if ptype == "rich_text":
+        return "".join(t.get("plain_text", "") for t in prop.get("rich_text") or []).strip()
+    if ptype == "select":
+        sel = prop.get("select")
+        return str(sel.get("name", "")).strip() if isinstance(sel, dict) else ""
+    if ptype == "status":
+        st = prop.get("status")
+        return str(st.get("name", "")).strip() if isinstance(st, dict) else ""
+    if ptype == "url":
+        return str(prop.get("url") or "").strip()
+    return ""
+
+
+class NotionKanbanClient:
+    """Two-way Notion database client supporting API 2025-09-03 with dynamic schema discovery."""
+
+    def __init__(self, api_key: str, database_id: str) -> None:
+        self.api_key = api_key
+        self.database_id = database_id
+        self.api_version = NOTION_VERSION
+        self.data_source_id: str | None = None
+        self.title_prop: str = "Name"
+        self.props_by_lower: dict[str, tuple[str, str]] = {}
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        *,
+        version: str | None = None,
+    ) -> dict:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            f"{NOTION_API_BASE}{path}",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Notion-Version": version or self.api_version,
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def discover_schema(self) -> None:
+        """Inspect database & data source properties so writes never fail on missing columns."""
+        try:
+            db = self._request("GET", f"/databases/{self.database_id}")
+        except urllib.error.HTTPError:
+            # Fallback to 2022-06-28 if workspace requires legacy database endpoint.
+            self.api_version = NOTION_LEGACY_VERSION
+            db = self._request("GET", f"/databases/{self.database_id}")
+
+        props = db.get("properties") or {}
+        data_sources = db.get("data_sources") or []
+        if data_sources and isinstance(data_sources[0], dict) and data_sources[0].get("id"):
+            self.data_source_id = str(data_sources[0]["id"])
+            try:
+                ds = self._request("GET", f"/data_sources/{self.data_source_id}")
+                if ds.get("properties"):
+                    props = ds["properties"]
+            except Exception:
+                pass
+
+        self.props_by_lower = {}
+        for name, meta in props.items():
+            if not isinstance(meta, dict):
+                continue
+            ptype = str(meta.get("type") or "")
+            self.props_by_lower[name.lower()] = (name, ptype)
+            if ptype == "title":
+                self.title_prop = name
+
+    def _parent(self) -> dict:
+        if self.data_source_id and self.api_version != NOTION_LEGACY_VERSION:
+            return {"type": "data_source_id", "data_source_id": self.data_source_id}
+        return {"database_id": self.database_id}
+
+    def build_properties(
+        self,
+        title: str,
+        *,
+        card_type: str = "",
+        status: str = "Inbox",
+        week_id: str = "",
+        url: str = "",
+        proof: str = "",
+    ) -> dict:
+        """Build property dict adapted strictly to columns that exist in the user's database."""
+        props: dict = {
+            self.title_prop: {"title": [{"text": {"content": title[:1900]}}]}
         }
 
-    children: list[dict] = []
-    if summary.get("week_in_one_take"):
-        children.append(_h2("The Week in One Take"))
-        children.append(_p([_rt(summary["week_in_one_take"])]))
+        def _set_if_exists(key_lower: str, value: str) -> None:
+            if not value or key_lower not in self.props_by_lower:
+                return
+            col_name, col_type = self.props_by_lower[key_lower]
+            if col_type == "select":
+                props[col_name] = {"select": {"name": value[:100]}}
+            elif col_type == "status":
+                props[col_name] = {"status": {"name": value[:100]}}
+            elif col_type == "rich_text":
+                props[col_name] = {"rich_text": [{"text": {"content": value[:1900]}}]}
+            elif col_type == "url" and value.startswith(("http://", "https://")):
+                props[col_name] = {"url": value}
 
+        _set_if_exists("type", card_type)
+        _set_if_exists("status", status)
+        _set_if_exists("week", week_id)
+        _set_if_exists("url", url)
+        _set_if_exists("proof", proof)
+        return props
+
+    def query_memory(self) -> tuple[list[dict], list[str], set[tuple[str, str]]]:
+        """Query existing Notion cards for two-way memory & duplicate prevention.
+
+        Returns:
+          - active_cards: cards in Drafting/Building/Starred/In Progress status
+          - dismissed_titles: titles marked Dismissed/Rejected
+          - existing_keys: set of (week_id.lower(), title.lower()) for idempotency
+        """
+        query_payload = {
+            "page_size": 100,
+            "sorts": [{"timestamp": "last_edited_time", "direction": "descending"}],
+        }
+        if self.data_source_id and self.api_version != NOTION_LEGACY_VERSION:
+            resp = self._request(
+                "POST", f"/data_sources/{self.data_source_id}/query", query_payload
+            )
+        else:
+            resp = self._request(
+                "POST",
+                f"/databases/{self.database_id}/query",
+                query_payload,
+                version=NOTION_LEGACY_VERSION,
+            )
+
+        active_cards: list[dict] = []
+        dismissed_titles: list[str] = []
+        existing_keys: set[tuple[str, str]] = set()
+
+        for page in resp.get("results") or []:
+            if not isinstance(page, dict) or page.get("archived") or page.get("in_trash"):
+                continue
+            page_id = str(page.get("id") or "").strip()
+            p_map = page.get("properties") or {}
+            title = _extract_notion_prop_text(p_map.get(self.title_prop))
+            if not title:
+                for p in p_map.values():
+                    if isinstance(p, dict) and p.get("type") == "title":
+                        title = _extract_notion_prop_text(p)
+                        break
+            if not title:
+                continue
+
+            status_col = self.props_by_lower.get("status", ("Status", ""))[0]
+            type_col = self.props_by_lower.get("type", ("Type", ""))[0]
+            week_col = self.props_by_lower.get("week", ("Week", ""))[0]
+
+            status_val = _extract_notion_prop_text(p_map.get(status_col))
+            type_val = _extract_notion_prop_text(p_map.get(type_col))
+            week_val = _extract_notion_prop_text(p_map.get(week_col))
+
+            existing_keys.add((week_val.lower(), title.lower()))
+            st_lower = status_val.lower()
+            if st_lower in ACTIVE_NOTION_STATUSES and page_id:
+                active_cards.append(
+                    {
+                        "page_id": page_id,
+                        "title": title,
+                        "status": status_val,
+                        "card_type": type_val,
+                        "week": week_val,
+                    }
+                )
+            elif st_lower in DISMISSED_NOTION_STATUSES:
+                dismissed_titles.append(title)
+
+        return active_cards[:10], dismissed_titles[:15], existing_keys
+
+    def create_card(
+        self,
+        title: str,
+        children: list[dict],
+        *,
+        card_type: str,
+        week_id: str,
+        url: str = "",
+        proof: str = "",
+        status: str = "Inbox",
+    ) -> dict:
+        payload = {
+            "parent": self._parent(),
+            "properties": self.build_properties(
+                title,
+                card_type=card_type,
+                status=status,
+                week_id=week_id,
+                url=url,
+                proof=proof,
+            ),
+            "children": children[:95],
+        }
+        return self._request("POST", "/pages", payload)
+
+    def append_followup_toggle(
+        self,
+        page_id: str,
+        week_id: str,
+        relevance_summary: str,
+        links: list[dict],
+    ) -> dict:
+        toggle_children = [_block_p([_rt(relevance_summary)])]
+        for lk in links:
+            if lk.get("url"):
+                toggle_children.append(
+                    _block_bullet([_rt(lk.get("label") or lk["url"], url=lk["url"])])
+                )
+        payload = {
+            "children": [
+                _block_toggle(f"Week {week_id} Follow-Up Evidence", toggle_children)
+            ]
+        }
+        return self._request("PATCH", f"/blocks/{page_id}/children", payload)
+
+
+def build_kanban_cards(week_id: str, summary: dict) -> list[dict]:
+    """Build structured Kanban cards (1 Weekly Brief + N Article Pitches + M Pain Points)."""
+    cards: list[dict] = []
+
+    # 1. Weekly Brief summary card
+    brief_children: list[dict] = []
+    if summary.get("week_in_one_take"):
+        brief_children.append(_block_h2("The Week in One Take"))
+        brief_children.append(_block_p([_rt(summary["week_in_one_take"])]))
     if summary.get("persisted_vs_faded"):
-        children.append(_h2("Persisted vs. Faded"))
+        brief_children.append(_block_h2("Persisted vs. Faded"))
         for entry in summary["persisted_vs_faded"]:
-            children.append(
-                _bullet([
+            brief_children.append(
+                _block_bullet([
                     _rt(f"[{entry['status'].upper()}] {entry['theme']}: ", bold=True),
                     _rt(entry["detail"]),
                 ])
             )
+    if summary.get("cross_platform_highlights"):
+        brief_children.append(_block_h2("Cross-Platform Convergence"))
+        for h in summary["cross_platform_highlights"]:
+            rt = [_rt(h["title"], bold=True, url=h.get("url") or None)]
+            if h.get("why_it_mattered"):
+                rt.append(_rt(f" — {h['why_it_mattered']}"))
+            brief_children.append(_block_bullet(rt))
+    if brief_children:
+        cards.append(
+            {
+                "title": f"Weekly Brief — {week_id}",
+                "card_type": "Weekly Brief",
+                "url": "",
+                "proof": "",
+                "children": brief_children,
+            }
+        )
 
-    if summary.get("article_pitches"):
-        children.append(_h2("Connect-the-Dots Article Pitches"))
-        for p in summary["article_pitches"]:
-            children.append(_p([_rt(p["working_title"], bold=True)]))
-            children.append(_p([_rt(p["core_thesis"])]))
-            if p.get("counterargument"):
-                children.append(
-                    _bullet([_rt("Counterargument: ", bold=True), _rt(p["counterargument"])])
+    # 2. Individual Article Pitch cards
+    for p in summary.get("article_pitches") or []:
+        children: list[dict] = [
+            _block_callout([_rt("Core Thesis: ", bold=True), _rt(p["core_thesis"])], "🧭"),
+        ]
+        if p.get("evidence"):
+            children.append(_block_h2("Supporting Evidence"))
+            for ev in p["evidence"]:
+                children.append(_block_bullet([_rt(ev["label"], url=ev["url"])]))
+        if p.get("counterargument"):
+            children.append(
+                _block_callout(
+                    [_rt("Strongest Counterargument: ", bold=True), _rt(p["counterargument"])],
+                    "⚠️",
                 )
-            for ev in p.get("evidence") or []:
-                children.append(_bullet([_rt(ev["label"], url=ev["url"])]))
+            )
+        children.append(_block_h2("My Angle / Draft Notes"))
+        children.append(_block_p([_rt("Move this card to Drafting to receive automatic weekly follow-up evidence.")]))
+        cards.append(
+            {
+                "title": p["working_title"],
+                "card_type": "Article Pitch",
+                "url": (p.get("evidence") or [{}])[0].get("url", ""),
+                "proof": f"{len(p.get('evidence') or [])} source threads",
+                "children": children,
+            }
+        )
 
-    if summary.get("validated_pain_points"):
-        children.append(_h2("Validated Pain Points & Build Angles"))
-        for p in summary["validated_pain_points"]:
-            rt = [_rt(p["problem"], bold=True), _rt(f" — {p.get('proof', '')}")]
-            if p.get("url"):
-                rt.append(_rt(" "))
-                rt.append(_rt("[link]", url=p["url"]))
-            children.append(_bullet(rt))
-            if p.get("build_angle"):
-                children.append(_p([_rt("Build angle: ", bold=True), _rt(p["build_angle"])]))
+    # 3. Individual Validated Pain Point / Build Idea cards
+    for p in summary.get("validated_pain_points") or []:
+        children = []
+        if p.get("proof"):
+            rt = [_rt("Proof: ", bold=True), _rt(p["proof"], url=p.get("url") or None)]
+            children.append(_block_p(rt))
+        if p.get("build_angle"):
+            children.append(
+                _block_callout([_rt("Build Angle: ", bold=True), _rt(p["build_angle"])], "🛠️")
+            )
+        children.append(_block_h2("Weekend MVP Checklist"))
+        children.append(_block_todo("Validate core friction on 1 real workflow"))
+        children.append(_block_todo("Scope a ruthless 4-hour prototype"))
+        cards.append(
+            {
+                "title": p["problem"],
+                "card_type": "Pain Point",
+                "url": p.get("url", ""),
+                "proof": p.get("proof", ""),
+                "children": children,
+            }
+        )
 
-    return {
-        "parent": {"database_id": database_id},
-        "properties": {
-            "Name": {
-                "title": [{"text": {"content": f"Weekly Tech Signal — {week_id}"}}]
+    return cards
+
+
+def extract_notion_id(url_or_id: str) -> str:
+    """Extract a canonical 32-hex Notion page/database ID from a URL or raw ID."""
+    cleaned = (url_or_id or "").strip().split("?", 1)[0].split("#", 1)[0]
+    m = re.search(
+        r"([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})",
+        cleaned,
+    )
+    if not m:
+        raise SystemExit(
+            f"Could not extract a 32-character Notion ID from '{url_or_id}'."
+        )
+    return m.group(1).replace("-", "")
+
+
+def create_kanban_database(
+    api_key: str,
+    parent_page_url_or_id: str,
+    title: str = "Tech Signal & Ideas",
+) -> dict:
+    """Create the pre-configured Kanban Notion database inside a shared parent page."""
+    parent_id = extract_notion_id(parent_page_url_or_id)
+    properties = {
+        "Name": {"title": {}},
+        "Status": {
+            "select": {
+                "options": [
+                    {"name": "Inbox", "color": "gray"},
+                    {"name": "Starred", "color": "yellow"},
+                    {"name": "Drafting", "color": "purple"},
+                    {"name": "Building", "color": "blue"},
+                    {"name": "Done", "color": "green"},
+                    {"name": "Dismissed", "color": "default"},
+                ]
             }
         },
-        "children": children[:95],  # Notion caps initial children at 100 blocks
+        "Type": {
+            "select": {
+                "options": [
+                    {"name": "Weekly Brief", "color": "blue"},
+                    {"name": "Article Pitch", "color": "purple"},
+                    {"name": "Pain Point", "color": "orange"},
+                ]
+            }
+        },
+        "Week": {"rich_text": {}},
+        "URL": {"url": {}},
+        "Proof": {"rich_text": {}},
     }
-
-
-def push_to_notion(week_id: str, summary: dict) -> bool:
-    """Optionally publish the weekly brief to a Notion database (fail-soft)."""
-    api_key = (os.environ.get("NOTION_API_KEY") or "").strip()
-    database_id = (os.environ.get("NOTION_DATABASE_ID") or "").strip()
-    if not (api_key and database_id):
-        return False
-
-    payload = json.dumps(build_notion_payload(database_id, week_id, summary)).encode()
+    payload = {
+        "parent": {"type": "page_id", "page_id": parent_id},
+        "title": [{"type": "text", "text": {"content": title}}],
+        "initial_data_source": {"properties": properties},
+    }
     req = urllib.request.Request(
-        NOTION_PAGES_API,
-        data=payload,
+        f"{NOTION_API_BASE}/databases",
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Notion-Version": NOTION_VERSION,
@@ -990,20 +1451,98 @@ def push_to_notion(week_id: str, summary: dict) -> bool:
         },
         method="POST",
     )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def init_notion_client() -> NotionKanbanClient | None:
+    """Create and introspect a NotionKanbanClient if credentials are configured."""
+    api_key = (os.environ.get("NOTION_API_KEY") or "").strip()
+    database_id = (os.environ.get("NOTION_DATABASE_ID") or "").strip()
+    if not (api_key and database_id):
+        return None
+    client = NotionKanbanClient(api_key, database_id)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp.read()
-        return True
+        client.discover_schema()
+        return client
     except Exception as e:
-        print(f"Warning: Notion export failed: {e}", file=sys.stderr)
-        return False
+        print(f"Warning: Notion schema discovery failed: {e}", file=sys.stderr)
+        return None
+
+
+def sync_to_notion(
+    client: NotionKanbanClient | None,
+    week_id: str,
+    summary: dict,
+    active_cards: list[dict],
+    existing_keys: set[tuple[str, str]],
+) -> tuple[int, int]:
+    """Push Kanban cards and append follow-up toggles to active Notion drafts (fail-soft)."""
+    if not client:
+        return 0, 0
+
+    created = 0
+    for card in build_kanban_cards(week_id, summary):
+        key = (week_id.lower(), card["title"].lower())
+        no_week_key = ("", card["title"].lower())
+        if key in existing_keys or no_week_key in existing_keys:
+            continue
+        try:
+            client.create_card(
+                card["title"],
+                card["children"],
+                card_type=card["card_type"],
+                week_id=week_id,
+                url=card["url"],
+                proof=card["proof"],
+            )
+            existing_keys.add(key)
+            created += 1
+        except Exception as e:
+            print(
+                f"Warning: failed to create Notion card '{card['title'][:50]}': {e}",
+                file=sys.stderr,
+            )
+
+    active_ids = {c["page_id"] for c in active_cards}
+    enriched = 0
+    for upd in summary.get("active_card_updates") or []:
+        if upd["page_id"] not in active_ids:
+            continue
+        try:
+            client.append_followup_toggle(
+                upd["page_id"],
+                week_id,
+                upd["relevance_summary"],
+                upd.get("links") or [],
+            )
+            enriched += 1
+        except Exception as e:
+            print(
+                f"Warning: failed to append follow-up to Notion page '{upd['page_id']}': {e}",
+                file=sys.stderr,
+            )
+
+    return created, enriched
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--init-notion":
+        api_key = (os.environ.get("NOTION_API_KEY") or "").strip()
+        if not api_key:
+            raise SystemExit("NOTION_API_KEY env var is required for --init-notion.")
+        db = create_kanban_database(api_key, args[1])
+        db_id = str(db.get("id") or "")
+        db_url = str(db.get("url") or "")
+        print(f"Created Notion Kanban database: {db_url or db_id}")
+        print(f"NOTION_DATABASE_ID={db_id.replace('-', '')}")
+        return 0
+
     archive_dir = (os.environ.get("ARCHIVE_DIR") or ".data").strip()
     watchlist_file = (os.environ.get("WATCHLIST_FILE") or "watchlist.json").strip()
 
@@ -1011,6 +1550,22 @@ def main() -> int:
     iso_year, iso_week, _ = now.isocalendar()
     week_id = f"{iso_year}-W{iso_week:02d}"
     date_str = now.strftime("%A, %d %B %Y (UTC)")
+
+    # Two-way Notion memory: read active Drafting/Building cards before synthesizing.
+    notion_client = init_notion_client()
+    active_cards: list[dict] = []
+    dismissed_titles: list[str] = []
+    existing_keys: set[tuple[str, str]] = set()
+    if notion_client:
+        try:
+            active_cards, dismissed_titles, existing_keys = notion_client.query_memory()
+            print(
+                f"Notion connected: {len(active_cards)} active draft/build card(s), "
+                f"{len(dismissed_titles)} dismissed topic(s).",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"Warning: Notion memory query failed: {e}", file=sys.stderr)
 
     daily_archives = load_daily_archives(archive_dir, days=7, today=now.date())
     prior_weeks = load_prior_weekly_archives(archive_dir, limit=3, before_week=week_id)
@@ -1063,6 +1618,8 @@ def main() -> int:
         lobsters=lobsters,
         issues=issues,
         overlaps=overlaps,
+        active_notion_cards=active_cards,
+        dismissed_titles=dismissed_titles,
     )
 
     meta = {
@@ -1073,7 +1630,7 @@ def main() -> int:
         "overlaps_count": len(overlaps),
     }
 
-    html = render_weekly_html(summary, week_id, date_str, meta)
+    html = render_weekly_html(summary, week_id, date_str, meta, active_cards=active_cards)
     text = render_weekly_text(summary, week_id, date_str)
     subject = f"Weekly Tech Signal & Angles — {week_id}"
 
@@ -1083,8 +1640,15 @@ def main() -> int:
         print("SMTP not configured — printing weekly synthesis below.\n", file=sys.stderr)
         print(text)
 
-    if push_to_notion(week_id, summary):
-        print("Weekly synthesis published to Notion.", file=sys.stderr)
+    if notion_client:
+        created, enriched = sync_to_notion(
+            notion_client, week_id, summary, active_cards, existing_keys
+        )
+        print(
+            f"Notion sync complete: created {created} Kanban card(s), "
+            f"enriched {enriched} active draft(s).",
+            file=sys.stderr,
+        )
 
     if archive_dir:
         out_path = save_weekly_archive(archive_dir, week_id, summary, meta)

@@ -365,6 +365,66 @@ class TestCallLlm(unittest.TestCase):
         self.assertEqual(captured_bodies[0][1], 180)
         self.assertNotIn("reasoning_effort", captured_bodies[1][0])
 
+    def test_503_exhaustion_falls_back_to_gemini_flash_lite(self):
+        called_models = []
+
+        def fake_urlopen(req, timeout=180):
+            body = json.loads(req.data.decode())
+            called_models.append(body["model"])
+            if body["model"] == "gemini-3.8-flash":
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    503,
+                    "Service Unavailable",
+                    {},
+                    io.BytesIO(b'{"error": {"code": 503, "status": "UNAVAILABLE"}}'),
+                )
+            return _mock_response(
+                json.dumps({"choices": [{"message": {"content": "fallback-ok"}}]}).encode()
+            )
+
+        with (
+            patch.dict(
+                os.environ,
+                {"LLM_PROVIDER": "gemini", "LLM_API_KEY": "test-key"},
+                clear=True,
+            ),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("time.sleep") as sleep,
+        ):
+            self.assertEqual(hn_digest.call_llm("sys", "usr"), "fallback-ok")
+
+        # 5 attempts on primary gemini-3.8-flash, then succeeds on gemini-3.5-flash-lite
+        self.assertEqual(called_models[:5], ["gemini-3.8-flash"] * 5)
+        self.assertEqual(called_models[5], "gemini-3.5-flash-lite")
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10, 20, 40])
+
+    def test_timeout_steps_down_medium_reasoning_effort_to_low(self):
+        efforts = []
+
+        def fake_urlopen(req, timeout=180):
+            efforts.append(json.loads(req.data.decode()).get("reasoning_effort"))
+            if len(efforts) == 1:
+                raise TimeoutError("read timed out")
+            return _mock_response(
+                json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+            )
+
+        with (
+            patch.dict(
+                os.environ,
+                {"LLM_PROVIDER": "gemini", "LLM_API_KEY": "test-key"},
+                clear=True,
+            ),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("time.sleep"),
+        ):
+            self.assertEqual(
+                hn_digest.call_llm("sys", "usr", reasoning_effort="medium"), "ok"
+            )
+
+        self.assertEqual(efforts, ["medium", "low"])
+
 
 class TestDailyArchiveAndAskShow(unittest.TestCase):
     def test_save_daily_archive_and_load_recent_continuity(self):

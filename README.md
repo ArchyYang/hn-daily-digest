@@ -109,6 +109,20 @@ personal account password — safer to store in CI.
 Use an [App Password](https://support.google.com/accounts/answer/185833)
 (not your normal password) with `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`.
 
+### Optional: Two-Way Notion Kanban Board (`weekly_synthesis.py`)
+
+Connect a Notion database to turn weekly briefs into a **two-way Pitch & Build Kanban board** (zero manual column setup needed):
+
+1. Create an internal integration at [notion.so/my-integrations](https://www.notion.so/my-integrations) and copy its secret (`NOTION_API_KEY`).
+2. Share any 1 parent Notion page with your integration (`...` → **Connections** → your integration) and run:
+   ```bash
+   NOTION_API_KEY=ntn_... python3 weekly_synthesis.py --init-notion "https://www.notion.so/your-page-url"
+   ```
+   This automatically creates the **Tech Signal & Ideas** database with all 6 columns (`Name`, `Status`, `Type`, `Week`, `URL`, `Proof`) and prints `NOTION_DATABASE_ID`.
+3. Add `NOTION_API_KEY` and `NOTION_DATABASE_ID` as GitHub Secrets (e.g. via `gh secret set`).
+
+**How two-way memory works:** Every Sunday, new pitches and pain points land in `Inbox`. Drag anything you want to work on to **`Drafting`** or **`Building`** (or mark rejects **`Dismissed`**). Next Sunday, `weekly_synthesis.py` reads your active cards before calling Gemini and appends collapsible **`Week YYYY-Www Follow-Up Evidence`** toggle blocks straight onto your Notion drafts whenever new HN, Lobste.rs, or GitHub threads reinforce or challenge your angle.
+
 ## Run locally
 
 ```bash

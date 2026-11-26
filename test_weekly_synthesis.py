@@ -167,21 +167,40 @@ class TestWeeklySynthesisAndNotion(unittest.TestCase):
                         "why_it_mattered": "Hit #1 on both HN and Lobste.rs.",
                     }
                 ],
+                "active_card_updates": [
+                    {
+                        "page_id": "page-active-1",
+                        "relevance_summary": "A new HN benchmark directly supports your thesis on plain CLIs.",
+                        "links": [
+                            {"label": "HN Benchmark", "url": "https://news.ycombinator.com/item?id=99"}
+                        ],
+                    }
+                ],
             }
         )
         summary = weekly_synthesis.parse_weekly_summary(raw)
+        active_cards = [
+            {
+                "page_id": "page-active-1",
+                "title": "CLI vs MCP Essay",
+                "status": "Drafting",
+                "card_type": "Article Pitch",
+            }
+        ]
         html = weekly_synthesis.render_weekly_html(
             summary,
             "2026-W48",
             "Sunday, 29 November 2026 (UTC)",
             {"hn_days": 7, "lobsters_count": 15, "issues_count": 12},
+            active_cards=active_cards,
         )
         text = weekly_synthesis.render_weekly_text(
             summary, "2026-W48", "Sunday, 29 November 2026 (UTC)"
         )
-        notion = weekly_synthesis.build_notion_payload("db-123", "2026-W48", summary)
 
         self.assertIn("Weekly Compounding Brief", html)
+        self.assertIn("Follow-Up Evidence Added to Your Active Notion Drafts", html)
+        self.assertIn("CLI vs MCP Essay", html)
         self.assertIn("PERSISTED", html)
         self.assertIn("Why Coding Agents Are Converging on Plain CLIs Over MCP", html)
         self.assertIn("Strongest counterargument:", html)
@@ -191,8 +210,144 @@ class TestWeeklySynthesisAndNotion(unittest.TestCase):
         self.assertIn("CONNECT-THE-DOTS ARTICLE PITCHES:", text)
         self.assertIn("VALIDATED PAIN POINTS & BUILD ANGLES:", text)
 
-        self.assertEqual(notion["parent"]["database_id"], "db-123")
-        self.assertGreater(len(notion["children"]), 5)
+        # Test Kanban cards generation (1 brief + 1 pitch + 1 pain point = 3 cards)
+        cards = weekly_synthesis.build_kanban_cards("2026-W48", summary)
+        self.assertEqual(len(cards), 3)
+        self.assertEqual([c["card_type"] for c in cards], ["Weekly Brief", "Article Pitch", "Pain Point"])
+
+    def test_notion_two_way_discovery_query_sync_and_toggle_append(self):
+        requests_made = []
+
+        def fake_urlopen(req, timeout=30):
+            body = json.loads(req.data.decode()) if req.data else None
+            requests_made.append((req.get_method(), req.full_url, body))
+            if req.full_url.endswith("/v1/databases/db-1"):
+                return _mock_json_response(
+                    {"id": "db-1", "data_sources": [{"id": "ds-1"}]}
+                )
+            if req.full_url.endswith("/v1/data_sources/ds-1"):
+                return _mock_json_response(
+                    {
+                        "id": "ds-1",
+                        "properties": {
+                            "Title": {"type": "title"},
+                            "Status": {"type": "status"},
+                            "Type": {"type": "select"},
+                            "Week": {"type": "rich_text"},
+                            "URL": {"type": "url"},
+                        },
+                    }
+                )
+            if req.full_url.endswith("/v1/data_sources/ds-1/query"):
+                return _mock_json_response(
+                    {
+                        "results": [
+                            {
+                                "id": "page-draft-1",
+                                "properties": {
+                                    "Title": {"type": "title", "title": [{"plain_text": "My Active Essay"}]},
+                                    "Status": {"type": "status", "status": {"name": "Drafting"}},
+                                    "Type": {"type": "select", "select": {"name": "Article Pitch"}},
+                                    "Week": {"type": "rich_text", "rich_text": [{"plain_text": "2026-W47"}]},
+                                },
+                            },
+                            {
+                                "id": "page-dismissed-1",
+                                "properties": {
+                                    "Title": {"type": "title", "title": [{"plain_text": "Crypto Noise"}]},
+                                    "Status": {"type": "status", "status": {"name": "Dismissed"}},
+                                    "Type": {"type": "select", "select": {"name": "Article Pitch"}},
+                                    "Week": {"type": "rich_text", "rich_text": [{"plain_text": "2026-W47"}]},
+                                },
+                            },
+                            {
+                                "id": "page-dup-1",
+                                "properties": {
+                                    "Title": {"type": "title", "title": [{"plain_text": "Weekly Brief — 2026-W48"}]},
+                                    "Status": {"type": "status", "status": {"name": "Inbox"}},
+                                    "Type": {"type": "select", "select": {"name": "Weekly Brief"}},
+                                    "Week": {"type": "rich_text", "rich_text": [{"plain_text": "2026-W48"}]},
+                                },
+                            },
+                        ]
+                    }
+                )
+            return _mock_json_response({"id": "created-page"})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client = weekly_synthesis.NotionKanbanClient("secret-key", "db-1")
+            client.discover_schema()
+            active, dismissed, existing = client.query_memory()
+
+            self.assertEqual(client.title_prop, "Title")
+            self.assertEqual(client.data_source_id, "ds-1")
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0]["page_id"], "page-draft-1")
+            self.assertEqual(dismissed, ["Crypto Noise"])
+
+            summary = {
+                "week_in_one_take": "Great week.",
+                "persisted_vs_faded": [],
+                "article_pitches": [
+                    {
+                        "working_title": "Brand New Pitch",
+                        "core_thesis": "Thesis text.",
+                        "evidence": [{"label": "HN", "url": "https://news.ycombinator.com/item?id=1"}],
+                        "counterargument": "Skeptic view.",
+                    }
+                ],
+                "validated_pain_points": [],
+                "cross_platform_highlights": [],
+                "active_card_updates": [
+                    {
+                        "page_id": "page-draft-1",
+                        "relevance_summary": "New supporting thread on HN.",
+                        "links": [{"label": "Thread", "url": "https://news.ycombinator.com/item?id=2"}],
+                    }
+                ],
+            }
+            created, enriched = weekly_synthesis.sync_to_notion(
+                client, "2026-W48", summary, active, existing
+            )
+
+        # Weekly Brief was already in existing -> skipped; Brand New Pitch -> created (1)
+        self.assertEqual(created, 1)
+        self.assertEqual(enriched, 1)
+        # Verify PATCH /v1/blocks/page-draft-1/children appended a toggle block
+        patch_calls = [r for r in requests_made if r[0] == "PATCH"]
+        self.assertEqual(len(patch_calls), 1)
+        self.assertTrue(patch_calls[0][1].endswith("/v1/blocks/page-draft-1/children"))
+        self.assertEqual(patch_calls[0][2]["children"][0]["type"], "toggle")
+        # Verify POST /v1/pages used discovered data_source_id and dynamic 'Title' column (not 'Name')
+        page_posts = [r for r in requests_made if r[0] == "POST" and r[1].endswith("/v1/pages")]
+        self.assertEqual(len(page_posts), 1)
+        self.assertEqual(page_posts[0][2]["parent"]["data_source_id"], "ds-1")
+        self.assertIn("Title", page_posts[0][2]["properties"])
+        self.assertNotIn("Proof", page_posts[0][2]["properties"])  # omitted since not in schema!
+
+    def test_extract_notion_id_and_create_kanban_database(self):
+        self.assertEqual(
+            weekly_synthesis.extract_notion_id(
+                "https://www.notion.so/My-Page-1234567890abcdef1234567890abcdef?pvs=4"
+            ),
+            "1234567890abcdef1234567890abcdef",
+        )
+        captured = []
+
+        def fake_urlopen(req, timeout=30):
+            captured.append((req.full_url, json.loads(req.data.decode())))
+            return _mock_json_response(
+                {"id": "aaaa1111-2222-3333-4444-555566667777", "url": "https://notion.so/db"}
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            db = weekly_synthesis.create_kanban_database(
+                "secret", "https://notion.so/Home-1234567890abcdef1234567890abcdef"
+            )
+        self.assertEqual(db["id"], "aaaa1111-2222-3333-4444-555566667777")
+        self.assertTrue(captured[0][0].endswith("/v1/databases"))
+        props = captured[0][1]["initial_data_source"]["properties"]
+        self.assertEqual(set(props.keys()), {"Name", "Status", "Type", "Week", "URL", "Proof"})
 
 
 if __name__ == "__main__":
